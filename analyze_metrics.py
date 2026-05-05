@@ -94,8 +94,6 @@ def load_data(benchmark_filter=None):
 
         if method == "base":
             continue
-        if method == "null" or method == "destructive" or method.startswith("random_"):
-            continue
         if benchmark_filter and benchmark != benchmark_filter:
             continue
 
