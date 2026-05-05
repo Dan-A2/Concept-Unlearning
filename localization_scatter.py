@@ -1,6 +1,6 @@
 """Localization scatter for concept-unlearning benchmarks.
 
-Generates plots per metric (CoFi, CHess) × model, saved as PNG and PDF.
+Generates one plot per model (CoFi only), saved as PNG and PDF.
 
 Three zones, decided geometrically:
 
@@ -115,7 +115,7 @@ def _strip_method_prefix(model_dir: str) -> str:
 
 def aggregate(df: pd.DataFrame, metric: str,
               forget_corpora: list[str], retain_corpora: list[str]) -> pd.DataFrame:
-    """metric in {'COFI', 'CHESS'}"""
+    """metric is 'COFI'."""
     sel = df[df["Metric"] == metric].copy()
     if sel.empty:
         raise SystemExit(f"No {metric} rows in cache.")
@@ -481,23 +481,20 @@ def main():
 
     bench_safe = args.benchmark.replace("-", "_")
 
-    for metric, metric_label, label_lower in [
-        ("COFI",  "CoFi",  "cofi"),
-        ("CHESS", "CHess", "chess"),
-    ]:
-        agg = aggregate(df, metric, forget_corpora, retain_corpora)
-        if agg.empty:
-            print(f"[skip] no rows for {metric}")
-            continue
+    metric, metric_label, label_lower = "COFI", "CoFi", "cofi"
+    agg = aggregate(df, metric, forget_corpora, retain_corpora)
+    if agg.empty:
+        print(f"[skip] no rows for {metric}")
+        return
 
-        for model_tag, model_label in MODEL_TAGS.items():
-            sub = agg[agg["model"] == model_tag]
-            if sub.empty:
-                print(f"[skip] {model_tag} {metric}: empty")
-                continue
-            tag_safe = model_tag.replace("-", "_").replace(".", "_")
-            out_path = out_dir / f"{bench_safe}_{label_lower}_{tag_safe}.png"
-            plot_single(agg, model_tag, model_label, metric, metric_label, out_path)
+    for model_tag, model_label in MODEL_TAGS.items():
+        sub = agg[agg["model"] == model_tag]
+        if sub.empty:
+            print(f"[skip] {model_tag} {metric}: empty")
+            continue
+        tag_safe = model_tag.replace("-", "_").replace(".", "_")
+        out_path = out_dir / f"{bench_safe}_{label_lower}_{tag_safe}.png"
+        plot_single(agg, model_tag, model_label, metric, metric_label, out_path)
 
 
 if __name__ == "__main__":
