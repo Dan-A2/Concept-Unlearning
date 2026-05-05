@@ -1,6 +1,6 @@
 # TRIAGE — LLM Unlearning Evaluation
 
-**TRIAGE** is a research framework for evaluating **machine unlearning methods** in large language models. The pipeline covers fine-tuning, unlearning, evaluation, falsification (null tests), and result aggregation — across multiple benchmarks and model families.
+**TRIAGE** is a research framework for evaluating **machine unlearning methods** in large language models. The pipeline covers fine-tuning, unlearning, evaluation, behavioral testing, and result aggregation — across multiple benchmarks and model families.
 
 ---
 
@@ -64,12 +64,10 @@ Concept-Unlearning/
 │
 ├── test.py                 # Main evaluation script (TRIAGE metrics)
 ├── behavioral_eval.py      # MCQ accuracy / memorization behavioral eval
-├── falsify_destructive.py  # Null test: pure gradient ascent (no retain)
-├── falsify_random.py       # Null test: norm-matched Gaussian noise
 │
 ├── analyze_metrics.py      # Plot unlearning metric curves per benchmark
 ├── localization_scatter.py # Scatter plots for layer localization analysis
-└── aggregate_results.py    # Aggregate falsification + behavioral JSONs to CSVs
+└── aggregate_results.py    # Aggregate evaluation + behavioral JSONs to CSVs
 ```
 
 > **Not tracked in this repo:** `checkpoints/`, `Results/`, `importances/`, `cofi_cache/`, `data/bio-forget-corpus/`, `data/cyber-forget-corpus/` — generated at runtime or too large for version control.
@@ -104,7 +102,7 @@ EOF
 
 ## Workflow
 
-The full pipeline runs in six stages. All commands assume you are in the project root.
+The full pipeline runs in five stages. All commands assume you are in the project root.
 
 ---
 
@@ -222,31 +220,7 @@ Each `--checkpoint` takes a path followed by a display label. Results are saved 
 
 ---
 
-### Stage 4 — Falsification (Null Tests)
-
-Two null baselines verify that observed metric changes are meaningful and not caused by arbitrary weight perturbation.
-
-**Destructive** — pure gradient ascent with no retain regularization:
-```bash
-python falsify_destructive.py \
-    --model_path checkpoints/tofu_finetune/Llama-3.1-8B \
-    --model_name Llama-3.1-8B \
-    --benchmark tofu --tofu_split forget10
-```
-
-**Random** — norm-matched Gaussian noise injected into base weights:
-```bash
-python falsify_random.py \
-    --base-model checkpoints/tofu_finetune/Llama-3.1-8B \
-    --source-checkpoint checkpoints/rmu/tofu-forget10/Llama-3.1-8B \
-    --method-tag rmu \
-    --bench-label tofu-forget10 \
-    --model-name Llama-3.1-8B
-```
-
----
-
-### Stage 5 — Behavioral Evaluation
+### Stage 4 — Behavioral Evaluation
 
 Runs MCQ accuracy (WMDP / MMLU) or memorization extraction (MUSE) on unlearned checkpoints:
 
@@ -260,7 +234,7 @@ Results are saved as `<ckpt>/behavioral_eval_<benchmark>.json`.
 
 ---
 
-### Stage 6 — Analysis & Aggregation
+### Stage 5 — Analysis & Aggregation
 
 **Plot metric curves per benchmark:**
 ```bash
