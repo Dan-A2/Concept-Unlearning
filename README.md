@@ -63,7 +63,7 @@ Concept-Unlearning/
 ├── muse_finetune.py        # Fine-tune on MUSE corpus
 │
 ├── test.py                 # Main evaluation script (TRIAGE metrics)
-├── behavioral_eval.py      # MCQ accuracy / memorization behavioral eval
+├── behavioral_eval.py      # MCQ accuracy
 │
 ├── analyze_metrics.py      # Plot unlearning metric curves per benchmark
 ├── localization_scatter.py # Scatter plots for layer localization analysis
@@ -222,7 +222,7 @@ Each `--checkpoint` takes a path followed by a display label. Results are saved 
 
 ### Stage 4 — Behavioral Evaluation
 
-Runs MCQ accuracy (WMDP / MMLU) or memorization extraction (MUSE) on unlearned checkpoints:
+Runs MCQ accuracy (WMDP / MMLU):
 
 ```bash
 python behavioral_eval.py \
