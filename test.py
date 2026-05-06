@@ -2,6 +2,7 @@ import gc
 import hashlib
 import math
 import os
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 import argparse
@@ -833,7 +834,8 @@ def main():
     )
 
     for name in list(corpora.keys()):
-        corpora[name] = corpora[name][:args.orig_max_samples]
+        if len(corpora[name]) > args.orig_max_samples:
+            corpora[name] = random.sample(corpora[name], args.orig_max_samples)
 
     for name, texts in corpora.items():
         print(f"  {name:15s}: {len(texts):6d} samples")
