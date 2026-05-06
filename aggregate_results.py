@@ -3,7 +3,6 @@
 Reads JSON files written by behavioral_eval.py, saved alongside each
 checkpoint at  <ckpt>/behavioral_eval_<bench>.json.
     wmdp -> wmdp_bio acc, wmdp_cyber acc, mmlu acc
-    muse -> mem_acc & 10-gram extraction likelihood for forget / retain1
     tofu -> whatever behavioral_eval writes for tofu
 
 Output: one table per (model, benchmark). Either pretty-printed to the terminal
@@ -23,8 +22,6 @@ CKPT_DIR = PROJECT_ROOT / "checkpoints"
 # Benchmark label (directory name on disk) -> behavioral_eval_<tag>.json suffix
 BENCH_TO_BEHAV_TAG = {
     "wmdp": "wmdp",
-    "muse-books": "muse",
-    "muse-news": "muse",
     "tofu-forget01": "tofu",
     "tofu-forget05": "tofu",
     "tofu-forget10": "tofu",
@@ -135,12 +132,6 @@ def collect_behavioral_rows(bench: str, family: str) -> Tuple[List[str], List[Di
                     r = results.get(task, {}) or {}
                     row[f"{task}__acc"] = r.get("acc")
                     row[f"{task}__stderr"] = r.get("acc_stderr")
-            elif behav_tag == "muse":
-                for split in ("forget", "retain1"):
-                    r = results.get(split, {}) or {}
-                    row[f"{split}__mem_acc"] = r.get("mem_acc")
-                    row[f"{split}__ngram10_logp"] = r.get("ngram10_logp_per_tok")
-                    row[f"{split}__ngram10_lik"] = r.get("ngram10_extraction_likelihood")
             rows.append(row)
 
     if not rows:
@@ -165,20 +156,12 @@ def _fmt(v, kind: str) -> str:
         return "—"
     if kind == "acc":
         return f"{x:6.4f}"
-    if kind == "logp":
-        return f"{x:8.3f}"
-    if kind == "lik":
-        return f"{x:9.3e}"
     return f"{x:.4f}"
 
 
 def _kind_for(col: str) -> str:
-    if col.endswith("__acc") or col.endswith("__stderr") or col.endswith("__mem_acc"):
+    if col.endswith("__acc") or col.endswith("__stderr"):
         return "acc"
-    if col.endswith("__ngram10_logp"):
-        return "logp"
-    if col.endswith("__ngram10_lik"):
-        return "lik"
     return "raw"
 
 
@@ -225,7 +208,7 @@ def write_csv(path: Path, cols: List[str], rows: List[Dict]):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--benchmark", action="append", default=None,
-                   help="Benchmark dir name (e.g. wmdp, muse-books). Repeat to select several. "
+                   help="Benchmark dir name (e.g. wmdp). Repeat to select several. "
                         "Default: all benchmarks discovered on disk.")
     p.add_argument("--model", action="append", default=None,
                    help="Model family (e.g. Llama-3.1-8B, zephyr-7b-beta). Repeat to select several. "
