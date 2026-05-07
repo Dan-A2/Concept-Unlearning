@@ -8,13 +8,7 @@ Three zones, decided geometrically:
   - Collateral-dominant: above y = x diagonal   -> salmon/orange
   - Partially-localized: below y = x diagonal   -> green
 
-A narrow strip around y = x is drawn as a HATCHED band on top of the
-underlying zone color (so the green/salmon shows through), marking
-points whose forget-vs-adjacent ordering is too close to call.
-
-Cluster of every point is decided strictly by the diagonal.  Points
-inside the hatched band get a dashed outer ring -- visual flag only,
-their cluster assignment doesn't change.
+Cluster of every point is decided strictly by the diagonal.
 """
 
 import argparse
@@ -26,7 +20,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 
 from analyze_metrics import load_data
 
@@ -76,7 +69,6 @@ BENCHMARK_CORPORA: dict[str, tuple[list[str], list[str]]] = {
 # Geometry constants ---------------------------------------------------------
 
 NOOP_BOX = 1.0           # corner box: both forget and retain <= this -> no-op
-DIAG_BAND_FRAC = 0.15    # ambiguous band around y = x: |y - x| / max(x,y) < this
 
 # Color palette --------------------------------------------------------------
 
@@ -85,11 +77,6 @@ ZONE_COLORS = {
     "collateral":  dict(face="#E8A4A4", alpha=0.45),  # muted red
     "noop":        dict(face="#95A5A6", alpha=0.55),  # gray, opaque
 }
-
-# Hatched ambiguous band style.  Tighter cross-hatching for a cleaner,
-# more professional look against either zone color.
-HATCH_STYLE = dict(facecolor="none", edgecolor="#2c2c2c",
-                   hatch="xxx", linewidth=0.0, alpha=0.45)
 
 # Point styling
 POINT_STYLE = {
@@ -144,17 +131,11 @@ def aggregate(df: pd.DataFrame, metric: str,
 
 
 def classify(forget, retain, noop_box=NOOP_BOX):
-    """Return (cluster, in_diag_band)."""
     if forget <= noop_box and retain <= noop_box:
-        return "noop", False
-
-    larger = max(forget, retain)
-    in_diag_band = (abs(retain - forget) / max(larger, 1e-9)) < DIAG_BAND_FRAC \
-                   if larger > noop_box else False
-
+        return "noop"
     if retain > forget:
-        return "collateral", in_diag_band
-    return "partial", in_diag_band
+        return "collateral"
+    return "partial"
 
 
 # --------------------------------------------------------------------------
@@ -233,8 +214,6 @@ def _style():
         "legend.fontsize": 9.5,
         "savefig.facecolor": "white",
         "figure.facecolor": "white",
-        # Hatch line width controls the thickness of the diagonal hatch lines.
-        "hatch.linewidth": 0.6,
     })
 
 
@@ -289,21 +268,6 @@ def _plot_axis(ax, sub, title, metric_label):
         edgecolor="none", zorder=0.6,
     ))
 
-    # ---- Hatched ambiguous band around y = x ---------------------------
-    # |y - x| / max(x, y) < DIAG_BAND_FRAC, only outside the no-op corner.
-    band_low  = x_grid * (1 - DIAG_BAND_FRAC)
-    band_high = x_grid * (1 + DIAG_BAND_FRAC)
-    ax.fill_between(
-        x_grid, band_low, band_high,
-        where=(x_grid > NOOP_BOX),
-        facecolor="none",
-        edgecolor=HATCH_STYLE["edgecolor"],
-        hatch=HATCH_STYLE["hatch"],
-        alpha=HATCH_STYLE["alpha"],
-        linewidth=0.0,
-        zorder=1,
-    )
-
     # ---- Reference line ------------------------------------------------
     ax.plot([lo, top], [lo, top],
             color="#444444", linestyle=(0, (5, 4)), linewidth=1.0,
@@ -313,20 +277,17 @@ def _plot_axis(ax, sub, title, metric_label):
             color="#666666", style="italic", zorder=3)
 
     # ---- Points --------------------------------------------------------
-    classifications = []
-    for _, row in sub.iterrows():
-        cluster, in_diag = classify(row["forget"], row["retain"])
-        classifications.append((cluster, in_diag))
+    classifications = [classify(row["forget"], row["retain"])
+                       for _, row in sub.iterrows()]
 
     label_pts = []
     for cluster_key in ["partial", "collateral", "noop"]:
-        idxs = [i for i, c in enumerate(classifications) if c[0] == cluster_key]
+        idxs = [i for i, c in enumerate(classifications) if c == cluster_key]
         if not idxs:
             continue
         style = POINT_STYLE[cluster_key]
         xs = [sub.iloc[i]["forget"] for i in idxs]
         ys = [sub.iloc[i]["retain"] for i in idxs]
-        ambiguous = [classifications[i][1] for i in idxs]
 
         # Filled marker
         ax.scatter(
@@ -346,19 +307,6 @@ def _plot_axis(ax, sub, title, metric_label):
             marker=style["marker"],
             zorder=4.5,
         )
-        # Dashed outer ring on points inside the ambiguous band
-        amb_xs = [x for x, a in zip(xs, ambiguous) if a]
-        amb_ys = [y for y, a in zip(ys, ambiguous) if a]
-        if amb_xs:
-            ax.scatter(
-                amb_xs, amb_ys, s=260,
-                facecolor="none",
-                edgecolor="#3a3a3a",
-                linewidth=1.1,
-                linestyle=(0, (2, 2)),
-                marker="o",
-                zorder=4.6,
-            )
         for i in idxs:
             label_pts.append((sub.iloc[i]["forget"],
                               sub.iloc[i]["retain"],
@@ -387,26 +335,15 @@ def _build_legend(fig):
         for k in ["partial", "collateral", "noop"]
     ]
 
-    # Hatched-band handle.  Patch with the same hatch style as the band
-    # itself, so the legend shows what the hatched region in the plot is.
-    ambiguous_band_handle = Patch(
-        facecolor="none",
-        edgecolor=HATCH_STYLE["edgecolor"],
-        hatch=HATCH_STYLE["hatch"],
-        alpha=HATCH_STYLE["alpha"],
-        linewidth=0.0,
-        label="Ambiguous band ($y \\approx x$)",
-    )
-
     diag_handle = Line2D(
         [0], [0], color="#444444", linestyle=(0, (5, 4)),
         linewidth=1.0, label="$y = x$",
     )
 
     fig.legend(
-        handles=cluster_handles + [ambiguous_band_handle, diag_handle],
+        handles=cluster_handles + [diag_handle],
         loc="lower center",
-        ncol=5,
+        ncol=4,
         bbox_to_anchor=(0.5, -0.02),
         frameon=True,
         edgecolor="#dddddd",
