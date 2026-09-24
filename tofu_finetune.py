@@ -4,25 +4,39 @@ This is a prerequisite for TOFU unlearning experiments.  The fine-tuned
 checkpoint is then passed as --model_path to the unlearning scripts with
 --benchmark tofu --tofu_split <split>.
 
-Pre-trained alternatives (skip this script):
-  locuslab/tofu_ft_llama2-7b   — Llama-2-7B fine-tuned on full TOFU
-  locuslab/tofu_ft_phi-1.5     — Phi-1.5 fine-tuned on full TOFU
+Hyperparameters follow the TOFU paper (Maini et al., 2024,
+https://arxiv.org/abs/2401.06121; github.com/locuslab/tofu) and the
+open-unlearning benchmark (github.com/locuslab/open-unlearning):
+
+  learning rate         : 1e-5
+  epochs                : 5
+  effective batch size  : 32    (via gradient accumulation)
+  weight decay          : 0.01
+  LR schedule           : linear warmup over the first epoch of optimizer
+                          steps, then linear decay to 0
+  loss                  : answer tokens only ("Question: {q}\n" is masked,
+                          matching locuslab/tofu label masking)
+  fine-tuning           : full-parameter (both benchmarks); pass
+                          --use_peft to fall back to LoRA + merge
 
 Usage:
   python tofu_finetune.py --model_path meta-llama/Llama-2-7b-hf
   python tofu_finetune.py --model_path meta-llama/Meta-Llama-3.1-8B --epochs 5
 """
 
+import math
 import numpy as np
 import torch
 import argparse
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 import tqdm as tqdm
 from pathlib import Path
 from datasets import load_dataset
 
 from baselines.utils import load_model, clear_cuda_cache
 from baselines.losses import compute_loss_from_logits, make_labels
+from baselines.benchmarks import TOFU_SPLITS
 from peft import LoraConfig, get_peft_model, TaskType
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -32,17 +46,25 @@ class Args:
     model_path = "meta-llama/Meta-Llama-3.1-8B"
     model_name = "Llama-3.1-8B"
 
-    lr = 2e-5
-    batch_size = 4
+    # TOFU paper / open-unlearning defaults
+    lr = 1e-5
     epochs = 5
     max_length = 512
+    weight_decay = 0.01
+    warmup_epochs = 1.0
 
-    # LoRA config
-    use_peft = True
-    lora_r = 32
-    lora_alpha = 64
+    # Per-device batch size and gradient accumulation to reach an
+    # effective batch size of 32 (TOFU paper / open-unlearning).
+    batch_size = 4
+    grad_accum_steps = 8
+
+    # LoRA config (only used with --use_peft; the benchmarks fine-tune
+    # all parameters)
+    use_peft = False
+    lora_r = 16
+    lora_alpha = 32
     lora_dropout = 0.05
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     seed = 42
 
@@ -54,12 +76,39 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default=None,
                         help="Short name for checkpoint dir. Defaults to last segment of --model_path.")
     parser.add_argument("--lr", type=float, default=Args.lr)
-    parser.add_argument("--batch_size", type=int, default=Args.batch_size)
+    parser.add_argument("--batch_size", type=int, default=Args.batch_size,
+                        help="Per-device batch size.")
+    parser.add_argument("--grad_accum_steps", type=int, default=Args.grad_accum_steps,
+                        help="Gradient accumulation steps (effective batch = batch_size * grad_accum_steps).")
     parser.add_argument("--epochs", type=int, default=Args.epochs)
     parser.add_argument("--max_length", type=int, default=Args.max_length)
+    parser.add_argument("--weight_decay", type=float, default=Args.weight_decay)
+    parser.add_argument("--warmup_epochs", type=float, default=Args.warmup_epochs,
+                        help="Epochs of linear LR warmup before linear decay "
+                             "(TOFU/open-unlearning use 1.0).")
+    parser.add_argument("--use_peft", action="store_true",
+                        help="Use LoRA instead of full fine-tuning (deviates from the benchmarks).")
     parser.add_argument("--lora_target_modules", type=str, nargs="+", default=None,
                         help="LoRA target module names.")
+    parser.add_argument("--retain", action="store_true",
+                        help="Train a RETAIN reference model: fine-tune on the "
+                             "retain split (complement of --tofu_split) instead of "
+                             "'full', and save under checkpoints/tofu_retain/<split>/. "
+                             "This is the reference model TOFU Forget Quality needs.")
+    parser.add_argument("--tofu_split", type=str, default="forget10",
+                        choices=["forget01", "forget05", "forget10"],
+                        help="Forget split whose RETAIN complement to train on "
+                             "(only used with --retain).")
     return parser.parse_args()
+
+
+def _linear_warmup_decay(optimizer, num_warmup, num_total):
+    def lr_lambda(step):
+        if step < num_warmup:
+            return float(step) / float(max(1, num_warmup))
+        progress = float(step - num_warmup) / float(max(1, num_total - num_warmup))
+        return max(0.0, 1.0 - progress)
+    return LambdaLR(optimizer, lr_lambda)
 
 
 def main():
@@ -69,10 +118,23 @@ def main():
     args.model_name = cli_args.model_name or cli_args.model_path.split("/")[-1]
     args.lr = cli_args.lr
     args.batch_size = cli_args.batch_size
+    args.grad_accum_steps = cli_args.grad_accum_steps
     args.epochs = cli_args.epochs
     args.max_length = cli_args.max_length
+    args.weight_decay = cli_args.weight_decay
+    args.warmup_epochs = cli_args.warmup_epochs
+    args.use_peft = cli_args.use_peft
     if cli_args.lora_target_modules is not None:
         args.lora_target_modules = cli_args.lora_target_modules
+
+    # Retain-reference mode: train on the retain complement of the forget split
+    # (e.g. forget10 -> retain90) and save under a dedicated directory.
+    args.retain = cli_args.retain
+    args.tofu_split = cli_args.tofu_split
+    if args.retain:
+        args.tofu_config = TOFU_SPLITS[args.tofu_split]   # e.g. "retain90"
+    else:
+        args.tofu_config = "full"
 
     SEED = args.seed
     torch.cuda.manual_seed(SEED)
@@ -94,18 +156,43 @@ def main():
         model.enable_input_require_grads()
         model.print_trainable_parameters()
 
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+
     model.train()
     device = next(model.parameters()).device
 
-    # Load full TOFU dataset (4000 QA pairs)
-    dataset = load_dataset("locuslab/TOFU", "full", split="train")
-    texts = [f"Question: {x['question']}\nAnswer: {x['answer']}" for x in dataset]
-    print(f"Loaded {len(texts)} TOFU QA pairs for fine-tuning.")
+    # Load the TOFU training split. Default 'full' (4000 QA); with --retain,
+    # the retain complement (e.g. retain90, 3600 QA). Loss is on the answer
+    # tokens only: the "Question: {q}\n" prefix is masked out, matching the
+    # TOFU reference implementation.
+    dataset = load_dataset("locuslab/TOFU", args.tofu_config, split="train")
+    prompts = [f"Question: {x['question']}\n" for x in dataset]
+    texts = [f"{p}Answer: {x['answer']}" for p, x in zip(prompts, dataset)]
+    print(f"Loaded {len(texts)} TOFU QA pairs from '{args.tofu_config}' "
+          f"for fine-tuning{' (RETAIN reference)' if args.retain else ''}.")
 
-    batches = [texts[i:i + args.batch_size] for i in range(0, len(texts), args.batch_size)]
+    n_batches = math.ceil(len(texts) / args.batch_size)
+    steps_per_epoch = math.ceil(n_batches / args.grad_accum_steps)
+    total_optim_steps = steps_per_epoch * args.epochs
+    num_warmup = max(1, int(args.warmup_epochs * steps_per_epoch))
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(params, lr=args.lr)
+    # AdamW with no weight decay on biases / LayerNorm params
+    no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight"]
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    optim_groups = [
+        {"params": [p for n, p in trainable if not any(nd in n for nd in no_decay)],
+         "weight_decay": args.weight_decay},
+        {"params": [p for n, p in trainable if any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+    ]
+    optimizer = AdamW(optim_groups, lr=args.lr)
+    scheduler = _linear_warmup_decay(optimizer, num_warmup, total_optim_steps)
+
+    print(f"Effective batch size: {args.batch_size * args.grad_accum_steps}  "
+          f"(per-device {args.batch_size} x {args.grad_accum_steps} grad accum)")
+    print(f"LR schedule: linear warmup {num_warmup} steps, linear decay over "
+          f"{total_optim_steps} total optimizer steps (peak lr {args.lr})")
 
     orig_trunc = tokenizer.truncation_side
     orig_pad = tokenizer.padding_side
@@ -114,23 +201,46 @@ def main():
 
     for epoch in range(args.epochs):
         epoch_loss = 0.0
+        optimizer.zero_grad()
+
+        # Reshuffle examples every epoch (the HF Trainer used by the
+        # benchmarks does the same).
+        order = np.random.permutation(len(texts))
+        batches = [order[i:i + args.batch_size]
+                   for i in range(0, len(order), args.batch_size)]
+
         with tqdm.tqdm(total=len(batches), desc=f"Epoch {epoch + 1}/{args.epochs}") as pbar:
-            for batch in batches:
+            for micro_idx, idx in enumerate(batches):
+                batch_texts = [texts[j] for j in idx]
+                batch_prompts = [prompts[j] for j in idx]
+
                 inputs = tokenizer(
-                    batch, return_tensors="pt", padding=True,
+                    batch_texts, return_tensors="pt", padding=True,
                     truncation=True, max_length=args.max_length,
                 ).to(device)
 
                 labels = make_labels(inputs.input_ids, inputs.attention_mask)
+                # Mask the question tokens so loss is on the answer only.
+                prompt_ids = tokenizer(batch_prompts)["input_ids"]
+                for row, p_ids in enumerate(prompt_ids):
+                    n = min(len(p_ids), labels.size(1))
+                    labels[row, :n] = -100
+
                 outputs = model(**inputs)
                 loss = compute_loss_from_logits(outputs.logits, labels)
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                (loss / args.grad_accum_steps).backward()
 
                 epoch_loss += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+                do_step = ((micro_idx + 1) % args.grad_accum_steps == 0
+                           or (micro_idx + 1) == len(batches))
+                if do_step:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                pbar.set_postfix(loss=f"{loss.item():.4f}",
+                                 lr=f"{scheduler.get_last_lr()[0]:.2e}")
                 pbar.update(1)
 
         avg = epoch_loss / len(batches)
@@ -142,8 +252,12 @@ def main():
     # Merge LoRA weights so the checkpoint can be loaded as a normal model
     if args.use_peft:
         model = model.merge_and_unload()
+    model.config.use_cache = True
 
-    path = str(SCRIPT_DIR / f"checkpoints/tofu_finetune/{args.model_name}")
+    if args.retain:
+        path = str(SCRIPT_DIR / f"checkpoints/tofu_retain/{args.tofu_split}/{args.model_name}")
+    else:
+        path = str(SCRIPT_DIR / f"checkpoints/tofu_finetune/{args.model_name}")
     model.save_pretrained(path)
     tokenizer.save_pretrained(path)
     print(f"Saved fine-tuned model to {path}")

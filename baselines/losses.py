@@ -179,45 +179,69 @@ def kl_frozen(updated_model, frozen_model, retain_inputs):
     return F.kl_div(probs, ref_probs, reduction='batchmean', log_target=True)
 
 
-def obliviate_vocab_kl(updated_model, unlearn_inputs, sensitive_token_ids):
+def obliviate_vocab_kl(updated_model, unlearn_inputs, sensitive_token_ids,
+                        chunk_tokens=2048):
     """Vocabulary-masking KL divergence on forget data (Obliviate).
 
     Zeroes out sensitive-token logits, then minimises KL between the full
-    distribution and the masked distribution.  This pushes the model to
+    distribution and the masked distribution. This pushes the model to
     redistribute probability mass away from sensitive tokens.
+
+    The KL is computed in chunks along the flattened (B*T) dimension to bound
+    peak memory — the dense [B, T, V] log_softmax/softmax tensors are by far
+    the largest activations and OOM the GPU on large-vocab models (e.g.
+    Qwen3-32B has V≈152K). Target distribution is detached: it is treated as
+    the fixed "masked" teacher signal.
     """
     outputs = updated_model(**unlearn_inputs)
     logits = outputs.logits
+    V = logits.size(-1)
 
-    vocab_mask = torch.ones(logits.size(-1), device=logits.device)
+    vocab_mask = torch.ones(V, device=logits.device, dtype=logits.dtype)
     for token_id in sensitive_token_ids:
-        if token_id < vocab_mask.size(0):
+        if token_id < V:
             vocab_mask[token_id] = 0
 
-    logits_masked = logits * vocab_mask
-    logits_probs = F.log_softmax(logits, dim=-1)
-    target_probs = F.softmax(logits_masked, dim=-1)
+    logits_flat = logits.view(-1, V)
+    N = logits_flat.size(0)
 
-    return F.kl_div(
-        logits_probs.view(-1, logits.size(-1)),
-        target_probs.view(-1, logits.size(-1)),
-        reduction="batchmean",
-    )
+    kl_sum = logits.new_zeros((), dtype=torch.float32)
+    for start in range(0, N, chunk_tokens):
+        chunk = logits_flat[start:start + chunk_tokens]
+        log_probs = F.log_softmax(chunk, dim=-1)
+        with torch.no_grad():
+            target = F.softmax(chunk * vocab_mask, dim=-1)
+        kl_sum = kl_sum + F.kl_div(log_probs, target, reduction="sum")
+
+    return kl_sum / N
 
 
-def obliviate_distill_mse(updated_model, frozen_model, retain_inputs):
-    """MSE distillation loss between student and teacher logits (Obliviate)."""
+def obliviate_distill_mse(updated_model, frozen_model, retain_inputs,
+                           chunk_tokens=2048):
+    """MSE distillation loss between student and teacher logits (Obliviate).
+
+    Computed in chunks along the flattened (B*T) dimension to keep peak
+    activation memory bounded on large-vocab models.
+    """
     outputs = updated_model(**retain_inputs)
     logits = outputs.logits
+    V = logits.size(-1)
 
     with torch.no_grad():
         teacher_outputs = frozen_model(**retain_inputs)
     teacher_logits = teacher_outputs.logits.to(logits.device)
 
-    return F.mse_loss(
-        logits.view(-1, logits.size(-1)),
-        teacher_logits.view(-1, teacher_logits.size(-1)),
-    )
+    logits_flat = logits.view(-1, V)
+    teacher_flat = teacher_logits.view(-1, V)
+    N = logits_flat.size(0)
+    denom = N * V
+
+    mse_sum = logits.new_zeros((), dtype=torch.float32)
+    for start in range(0, N, chunk_tokens):
+        diff = logits_flat[start:start + chunk_tokens] - teacher_flat[start:start + chunk_tokens]
+        mse_sum = mse_sum + diff.pow(2).sum()
+
+    return mse_sum / denom
 
 
 def obliviate_retain_ce(updated_model, frozen_model, retain_inputs, pad_token_id=-100):

@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
 
 from analyze_metrics import load_data
 
@@ -48,9 +49,13 @@ METHOD_DISPLAY = {
     "spul":         "SPUL",
 }
 
+# Substring matched against the (underscore-safe) checkpoint dir name -> title.
+# Cache dirs use '_' for '.', e.g. 'kl-Llama-3_2-3B'.
 MODEL_TAGS = {
     "Llama-3_1-8B":   "Llama-3.1-8B",
+    "Llama-3_2-3B":   "Llama-3.2-3B",
     "zephyr-7b-beta": "Zephyr-7B-$\\beta$",
+    "Qwen3-32B":      "Qwen3-32B",
 }
 
 # Per-benchmark forget / retain corpora (values of the Dataset column in the
@@ -83,7 +88,7 @@ POINT_STYLE = {
     "partial":     dict(face="#2E8B57", edge="#1B5E3A", marker="o",
                         label="Partially-localized"),
     "collateral":  dict(face="#B0413E", edge="#6E1F1D", marker="D",
-                        label="Collateral-dominant"),
+                        label="Collateral-dominant & Globally destructive"),
     "noop":        dict(face="#95A5A6", edge="#566970", marker="s",
                         label="No-op"),
 }
@@ -116,16 +121,24 @@ def aggregate(df: pd.DataFrame, metric: str,
         model_tag = _strip_method_prefix(model_dir)
         if model_tag not in MODEL_TAGS:
             continue
-        f_vals = sub.loc[sub["Dataset"].isin(forget_corpora), "Value"].dropna()
-        r_vals = sub.loc[sub["Dataset"].isin(retain_corpora), "Value"].dropna()
+        f_sel = sub.loc[sub["Dataset"].isin(forget_corpora)]
+        r_sel = sub.loc[sub["Dataset"].isin(retain_corpora)]
+        f_vals = f_sel["Value"].dropna()
+        r_vals = r_sel["Value"].dropna()
         if f_vals.empty or r_vals.empty:
             continue
+        # Per-axis 95% CI half-width for the "blur" — mean of the per-corpus CIs
+        # (across the 3 CoFi subsets) on each axis. NaN when only 1 subset.
+        f_ci = f_sel["CI95"].dropna() if "CI95" in f_sel else pd.Series(dtype=float)
+        r_ci = r_sel["CI95"].dropna() if "CI95" in r_sel else pd.Series(dtype=float)
         rows.append({
             "method": method,
             "display": METHOD_DISPLAY.get(method, method),
             "model": model_tag,
             "forget": float(f_vals.mean()),
             "retain": float(r_vals.mean()),
+            "forget_ci": float(f_ci.mean()) if not f_ci.empty else float("nan"),
+            "retain_ci": float(r_ci.mean()) if not r_ci.empty else float("nan"),
         })
     return pd.DataFrame(rows)
 
@@ -289,6 +302,21 @@ def _plot_axis(ax, sub, title, metric_label):
         xs = [sub.iloc[i]["forget"] for i in idxs]
         ys = [sub.iloc[i]["retain"] for i in idxs]
 
+        # Single 95% CI ellipse per point (semi-axes = the per-axis CI
+        # half-widths across the 3 CoFi subsets). Skipped when a CI is missing
+        # (e.g. only 1 subset computed) or degenerate.
+        for i in idxs:
+            fci = sub.iloc[i].get("forget_ci", float("nan"))
+            rci = sub.iloc[i].get("retain_ci", float("nan"))
+            if not (np.isfinite(fci) and np.isfinite(rci)) or (fci <= 0 and rci <= 0):
+                continue
+            cx, cy = sub.iloc[i]["forget"], sub.iloc[i]["retain"]
+            ax.add_patch(Ellipse(
+                (cx, cy), width=2 * fci, height=2 * rci,
+                facecolor=style["face"], edgecolor="none",
+                alpha=0.18, zorder=3.6,
+            ))
+
         # Filled marker
         ax.scatter(
             xs, ys, s=130,
@@ -344,7 +372,7 @@ def _build_legend(fig):
         handles=cluster_handles + [diag_handle],
         loc="lower center",
         ncol=4,
-        bbox_to_anchor=(0.5, -0.02),
+        bbox_to_anchor=(0.5, 0.0),
         frameon=True,
         edgecolor="#dddddd",
         fontsize=9.5,
@@ -354,7 +382,7 @@ def _build_legend(fig):
 def plot_single(agg: pd.DataFrame, model_tag: str, model_label: str,
                 metric: str, metric_label: str, out_path: Path):
     _style()
-    fig, ax = plt.subplots(1, 1, figsize=(7.6, 6.8))
+    fig, ax = plt.subplots(1, 1, figsize=(9.8, 9.4))
     _plot_axis(
         ax,
         agg[agg["model"] == model_tag],
@@ -362,7 +390,7 @@ def plot_single(agg: pd.DataFrame, model_tag: str, model_label: str,
         metric_label,
     )
     _build_legend(fig)
-    fig.tight_layout(rect=(0, 0.06, 1, 1.0))
+    fig.tight_layout(rect=(0, 0.04, 1, 1.0))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     fig.savefig(out_path.with_suffix(".pdf"), bbox_inches="tight")

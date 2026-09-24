@@ -4,7 +4,6 @@ Supported benchmarks:
   wmdp  — WMDP bio/cyber forget corpora (2 topics, default)
   tofu  — TOFU fictitious authors (1 topic, requires prior fine-tuning)
   muse  — MUSE news/books corpora (1 topic, --muse_corpus required)
-  blur  — BLUR forget/retain evaluation (1 topic, --blur_task required)
 """
 
 TOFU_SPLITS = {
@@ -15,11 +14,8 @@ TOFU_SPLITS = {
 
 MUSE_CORPORA = {"news", "books"}
 
-BLUR_TASKS = {"rwku", "whp"}
 
-
-def get_benchmark_config(benchmark, tofu_split=None, muse_corpus=None,
-                         blur_task=None):
+def get_benchmark_config(benchmark, tofu_split=None, muse_corpus=None):
     """Return a dict with forget_corpora, retain_corpora, topic_names,
     max_lengths, and bench_label for the chosen benchmark."""
 
@@ -32,7 +28,7 @@ def get_benchmark_config(benchmark, tofu_split=None, muse_corpus=None,
             bench_label="wmdp",
         )
 
-    if benchmark == "tofu":
+    elif benchmark == "tofu":
         if tofu_split not in TOFU_SPLITS:
             raise ValueError(
                 f"--tofu_split must be one of {list(TOFU_SPLITS)}, got {tofu_split}"
@@ -46,7 +42,7 @@ def get_benchmark_config(benchmark, tofu_split=None, muse_corpus=None,
             bench_label=f"tofu-{tofu_split}",
         )
 
-    if benchmark == "muse":
+    elif benchmark == "muse":
         if muse_corpus not in MUSE_CORPORA:
             raise ValueError(
                 f"--muse_corpus must be one of {sorted(MUSE_CORPORA)}, "
@@ -63,28 +59,24 @@ def get_benchmark_config(benchmark, tofu_split=None, muse_corpus=None,
             bench_label=f"muse-{muse_corpus}",
         )
 
-    if benchmark == "blur":
-        if blur_task not in BLUR_TASKS:
-            raise ValueError(
-                f"--blur_task must be one of {sorted(BLUR_TASKS)}, "
-                f"got {blur_task}"
-            )
+    elif benchmark == "inject":
+        # Known-fact injection oracle experiment: unlearn F from theta_inj while
+        # retaining A. Corpora are saved to data/inject-{F,A} by
+        # known_fact_injection.py --stages save_inj.
         return dict(
-            forget_corpora=[f"blur-{blur_task}-forget"],
-            retain_corpora=[f"blur-{blur_task}-retain"],
-            topic_names={0: f"blur-{blur_task}"},
-            max_lengths=[512],
-            bench_label=f"blur-{blur_task}",
+            forget_corpora=["inject-F"],
+            retain_corpora=["inject-A"],
+            topic_names={0: "inject"},
+            max_lengths=[128],
+            bench_label="inject",
         )
 
     raise ValueError(f"Unknown benchmark: {benchmark}")
 
 
-def apply_benchmark_config(args, benchmark, tofu_split=None,
-                           muse_corpus=None, blur_task=None):
+def apply_benchmark_config(args, benchmark, tofu_split=None, muse_corpus=None):
     """Modify an Args object in-place based on the chosen benchmark."""
-    config = get_benchmark_config(benchmark, tofu_split, muse_corpus,
-                                  blur_task)
+    config = get_benchmark_config(benchmark, tofu_split, muse_corpus)
 
     args.forget_corpora = config["forget_corpora"]
     args.retain_corpora = config["retain_corpora"]
@@ -107,7 +99,7 @@ def add_benchmark_args(parser):
     """Add --benchmark and related arguments to an argparse parser."""
     parser.add_argument(
         "--benchmark", type=str, default="wmdp",
-        choices=["wmdp", "tofu", "muse", "blur"],
+        choices=["wmdp", "tofu", "muse", "inject"],
         help="Unlearning benchmark (default: wmdp).",
     )
     parser.add_argument(
@@ -119,9 +111,4 @@ def add_benchmark_args(parser):
         "--muse_corpus", type=str, default=None,
         choices=["news", "books"],
         help="MUSE corpus (required when --benchmark muse).",
-    )
-    parser.add_argument(
-        "--blur_task", type=str, default=None,
-        choices=["rwku", "whp"],
-        help="BLUR task (required when --benchmark blur).",
     )

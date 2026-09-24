@@ -15,14 +15,18 @@ evaluation use the 'raw' subset (forget / retain1 / retain2 / holdout).
 
 Hyperparameters follow the MUSE paper (Shi et al., 2024,
 https://arxiv.org/abs/2407.06460) and its reference implementation
-(github.com/swj0419/muse_bench):
+(github.com/swj0419/muse_bench).  The paper fine-tunes the target
+models "for 5 epochs with a constant learning rate of 1e-5 and a
+batch size of 32":
 
   learning rate         : 1e-5
-  epochs                : 10
+  epochs                : 5
   max sequence length   : 2048
-  weight decay          : 0.01
-  warmup ratio          : 0.03  (linear warmup -> linear decay)
+  weight decay          : 0.0   (HF default, as in muse_bench)
+  LR schedule           : constant (paper; muse_bench's finetune.py
+                          default is cosine — see --lr_scheduler)
   effective batch size  : 32    (via gradient accumulation)
+  fine-tuning           : full-parameter (pass --use_peft for LoRA)
 
 Usage:
   python muse_finetune.py --model_path meta-llama/Meta-Llama-3.1-8B \
@@ -53,22 +57,25 @@ class Args:
 
     # MUSE paper defaults
     lr = 1e-5
-    epochs = 10
+    epochs = 5
     max_length = 2048
-    weight_decay = 0.01
-    warmup_ratio = 0.03
+    weight_decay = 0.0
+    warmup_ratio = 0.0
+    lr_scheduler = "constant"   # "constant" (paper), "cosine" (muse_bench), "linear"
 
     # Per-device batch size and gradient accumulation to reach an
     # effective batch size of 32 (MUSE paper).
     batch_size = 1
     grad_accum_steps = 32
 
-    # LoRA config (matches tofu_finetune.py)
-    use_peft = True
-    lora_r = 32
-    lora_alpha = 64
+    # LoRA config (only used with --use_peft; MUSE target models are
+    # fully fine-tuned)
+    use_peft = False
+    load_in_4bit = False   # QLoRA: 4-bit base + LoRA (needed for Qwen3-32B)
+    lora_r = 16
+    lora_alpha = 32
     lora_dropout = 0.05
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     seed = 42
 
@@ -90,18 +97,33 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=Args.epochs)
     parser.add_argument("--max_length", type=int, default=Args.max_length)
     parser.add_argument("--weight_decay", type=float, default=Args.weight_decay)
-    parser.add_argument("--warmup_ratio", type=float, default=Args.warmup_ratio)
+    parser.add_argument("--warmup_ratio", type=float, default=Args.warmup_ratio,
+                        help="Fraction of optimizer steps used for linear warmup "
+                             "(applies to all schedules; paper uses none).")
+    parser.add_argument("--lr_scheduler", type=str, default=Args.lr_scheduler,
+                        choices=["constant", "cosine", "linear"],
+                        help="LR schedule: 'constant' matches the MUSE paper, "
+                             "'cosine' matches muse_bench's finetune.py default.")
+    parser.add_argument("--use_peft", action="store_true",
+                        help="Use LoRA instead of full fine-tuning (deviates from MUSE).")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                        help="Load base in 4-bit NF4 (QLoRA); use with --use_peft for Qwen3-32B.")
     parser.add_argument("--lora_target_modules", type=str, nargs="+", default=None,
                         help="LoRA target module names.")
     return parser.parse_args()
 
 
-def _linear_warmup_decay(optimizer, num_warmup, num_total):
+def _make_scheduler(optimizer, kind, num_warmup, num_total):
     def lr_lambda(step):
         if step < num_warmup:
             return float(step) / float(max(1, num_warmup))
+        if kind == "constant":
+            return 1.0
         progress = float(step - num_warmup) / float(max(1, num_total - num_warmup))
-        return max(0.0, 1.0 - progress)
+        progress = min(1.0, progress)
+        if kind == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(0.0, 1.0 - progress)  # linear
     return LambdaLR(optimizer, lr_lambda)
 
 
@@ -179,6 +201,9 @@ def main():
     args.max_length = cli_args.max_length
     args.weight_decay = cli_args.weight_decay
     args.warmup_ratio = cli_args.warmup_ratio
+    args.lr_scheduler = cli_args.lr_scheduler
+    args.use_peft = cli_args.use_peft
+    args.load_in_4bit = cli_args.load_in_4bit
     if cli_args.lora_target_modules is not None:
         args.lora_target_modules = cli_args.lora_target_modules
 
@@ -188,7 +213,7 @@ def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    model, tokenizer = load_model(args.model_path)
+    model, tokenizer = load_model(args.model_path, load_in_4bit=args.load_in_4bit)
 
     if args.use_peft:
         lora_config = LoraConfig(
@@ -202,6 +227,9 @@ def main():
         model.enable_input_require_grads()
         model.print_trainable_parameters()
 
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+
     model.train()
     device = next(model.parameters()).device
 
@@ -214,7 +242,7 @@ def main():
 
     steps_per_epoch = math.ceil(len(batches) / args.grad_accum_steps)
     total_optim_steps = steps_per_epoch * args.epochs
-    num_warmup = max(1, int(args.warmup_ratio * total_optim_steps))
+    num_warmup = int(args.warmup_ratio * total_optim_steps)
 
     # AdamW with no weight decay on biases / LayerNorm params
     no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight"]
@@ -226,14 +254,15 @@ def main():
          "weight_decay": 0.0},
     ]
     optimizer = AdamW(optim_groups, lr=args.lr)
-    scheduler = _linear_warmup_decay(optimizer, num_warmup, total_optim_steps)
+    scheduler = _make_scheduler(optimizer, args.lr_scheduler, num_warmup, total_optim_steps)
 
     print(f"Effective batch size: {args.batch_size * args.grad_accum_steps}  "
           f"(per-device {args.batch_size} x {args.grad_accum_steps} grad accum)")
     print(f"Micro-batches per epoch: {len(batches)}  "
           f"Optimizer steps per epoch: {steps_per_epoch}")
     print(f"Total optimizer steps: {total_optim_steps}  "
-          f"(warmup {num_warmup}, max_len {args.max_length}, lr {args.lr})")
+          f"(schedule {args.lr_scheduler}, warmup {num_warmup}, "
+          f"max_len {args.max_length}, lr {args.lr})")
 
     global_step = 0
     for epoch in range(args.epochs):
@@ -273,6 +302,7 @@ def main():
     # Merge LoRA weights so the checkpoint can be loaded as a normal model
     if args.use_peft:
         model = model.merge_and_unload()
+    model.config.use_cache = True
 
     path = str(SCRIPT_DIR / f"checkpoints/muse_finetune/{args.muse_corpus}/{args.model_name}")
     model.save_pretrained(path)

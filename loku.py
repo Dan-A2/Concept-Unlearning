@@ -27,7 +27,7 @@ import argparse
 from torch.optim import AdamW
 from pathlib import Path
 
-from baselines.utils import load_model, get_params, get_data, clear_cuda_cache, save_topic_loss_plot
+from baselines.utils import load_model, get_data, clear_cuda_cache, save_topic_loss_plot
 from baselines.benchmarks import add_benchmark_args, apply_benchmark_config
 from baselines.losses import ihl, compute_loss_from_logits, make_labels
 from peft import LoraConfig, get_peft_model, TaskType
@@ -53,15 +53,13 @@ class Args:
     max_num_batches = 500
 
     target_layers = [7]
-    layer_ids = [5, 6, 7]
-    param_ids = [6]
 
     # PEFT (LoRA) config
     use_peft = True
-    lora_r = 32
-    lora_alpha = 64
+    lora_r = 16
+    lora_alpha = 32
     lora_dropout = 0.05
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     # FILA config
     fila_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -89,9 +87,13 @@ def parse_args():
                         help="LoRA target module names.")
     parser.add_argument("--skip_fila", action="store_true",
                         help="Skip FILA init; use standard LoRA zero-init instead.")
-    parser.add_argument("--importance_batches", type=int, default=None,
+    parser.add_argument("--importance_batches", type=int, default=200,
                         help="Number of batches for Fisher computation. "
-                             "Defaults to all available batches.")
+                             "Defaults to 200 (original LoKu repo setting).")
+    parser.add_argument("--importance_batch_size", type=int, default=2,
+                        help="Per-step batch size used during Fisher computation. "
+                             "Defaults to 2 (original LoKu repo setting).")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit NF4 (QLoRA) for memory-constrained models such as Qwen3-32B.")
     add_benchmark_args(parser)
     return parser.parse_args()
 
@@ -110,14 +112,45 @@ def compute_fisher_importances(model, tokenizer, forget_data_list, retain_data_l
 
     target_names = args.fila_target_modules
 
-    importance_f = {}
-    importance_r = {}
+    # Freeze non-target params so backward doesn't compute their grads.
+    # Quantized (e.g. 4-bit) weights are stored as non-float dtypes and can't
+    # carry autograd; skip those silently and collect them so the caller can
+    # decide what to do (typically: skip FILA init).
+    original_requires_grad = {}
+    tracked_params = []
+    skipped_non_float = 0
     for name, param in model.named_parameters():
-        if any(t in name for t in target_names) and "weight" in name:
-            importance_f[name] = torch.zeros_like(param, dtype=torch.float32, device="cpu")
-            importance_r[name] = torch.zeros_like(param, dtype=torch.float32, device="cpu")
+        original_requires_grad[name] = param.requires_grad
+        is_target = any(t in name for t in target_names) and "weight" in name
+        if is_target and not param.is_floating_point():
+            skipped_non_float += 1
+            param.requires_grad_(False)
+            continue
+        param.requires_grad_(is_target)
+        if is_target:
+            tracked_params.append((name, param))
 
-    print(f"Tracking Fisher importance for {len(importance_f)} weight matrices.")
+    if skipped_non_float > 0:
+        print(f"Skipped {skipped_non_float} non-float (likely 4-bit) target weights "
+              "for Fisher computation.")
+
+    if not tracked_params:
+        # Restore flags and bail out — caller will fall back to skip_fila.
+        for name, param in model.named_parameters():
+            param.requires_grad_(original_requires_grad.get(name, True))
+        return None
+
+    # GPU-resident fp32 accumulators; one .cpu() at the end.
+    importance_f = {
+        name: torch.zeros_like(param, dtype=torch.float32, device=param.device)
+        for name, param in tracked_params
+    }
+    importance_r = {
+        name: torch.zeros_like(param, dtype=torch.float32, device=param.device)
+        for name, param in tracked_params
+    }
+
+    print(f"Tracking Fisher importance for {len(tracked_params)} weight matrices.")
 
     truncation_side = tokenizer.truncation_side
     padding_side = tokenizer.padding_side
@@ -132,7 +165,6 @@ def compute_fisher_importances(model, tokenizer, forget_data_list, retain_data_l
     f_cnt = 0
     r_cnt = 0
 
-    total = max_batches_per_topic * n_topics
     for batch_idx in range(max_batches_per_topic):
         for topic_idx in range(n_topics):
             max_length = args.max_lengths[topic_idx]
@@ -151,9 +183,9 @@ def compute_fisher_importances(model, tokenizer, forget_data_list, retain_data_l
             loss.backward()
 
             cnt = (labels != -100).sum().item()
-            for name, param in model.named_parameters():
-                if name in importance_f and param.grad is not None:
-                    importance_f[name] += (param.grad.pow(2).float() * cnt).detach().cpu()
+            for name, param in tracked_params:
+                if param.grad is not None:
+                    importance_f[name].add_(param.grad.float().pow_(2), alpha=cnt)
                     param.grad = None
             f_cnt += cnt
 
@@ -171,17 +203,23 @@ def compute_fisher_importances(model, tokenizer, forget_data_list, retain_data_l
             loss.backward()
 
             cnt = (labels != -100).sum().item()
-            for name, param in model.named_parameters():
-                if name in importance_r and param.grad is not None:
-                    importance_r[name] += (param.grad.pow(2).float() * cnt).detach().cpu()
+            for name, param in tracked_params:
+                if param.grad is not None:
+                    importance_r[name].add_(param.grad.float().pow_(2), alpha=cnt)
                     param.grad = None
             r_cnt += cnt
-
-            # pbar.update(1)
 
     model.zero_grad(set_to_none=True)
     tokenizer.truncation_side = truncation_side
     tokenizer.padding_side = padding_side
+
+    # Move accumulators to CPU once at the end.
+    importance_f = {n: t.detach().cpu() for n, t in importance_f.items()}
+    importance_r = {n: t.detach().cpu() for n, t in importance_r.items()}
+
+    # Restore original requires_grad flags.
+    for name, param in model.named_parameters():
+        param.requires_grad_(original_requires_grad.get(name, True))
 
     return {
         "f_cnt": f_cnt,
@@ -207,12 +245,12 @@ def _get_module_by_name(model, name):
     return obj
 
 
-def apply_fila_init(model, importance_file, args):
+def apply_fila_init(model, imp, args):
     """Re-initialize LoRA A/B weights using Fisher-weighted SVD (FILA).
 
     model must already have LoRA adapters applied via PEFT.
+    ``imp`` is the dict returned by :func:`compute_fisher_importances`.
     """
-    imp = torch.load(importance_file, map_location="cpu", weights_only=False)
     f_cnt = imp["f_cnt"]
     r_cnt = imp["r_cnt"]
     importance_f = imp["importance_f"]
@@ -285,10 +323,10 @@ def _apply_lora(updated_model, args):
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=args.lora_target_modules,
-        layers_to_transform=args.layer_ids,
     )
     updated_model = get_peft_model(updated_model, lora_config)
     updated_model.enable_input_require_grads()
+    updated_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     updated_model.print_trainable_parameters()
     return updated_model
 
@@ -299,18 +337,18 @@ def run_loku(
     forget_data_list,
     retain_data_list,
     args,
+    importances=None,
 ):
     updated_model = _apply_lora(updated_model, args)
 
     # FILA initialization (optional)
     if not args.skip_fila:
-        imp_path = SCRIPT_DIR / "importances" / f"{args.model_name}_{args.bench_label}.pt"
-        if not imp_path.exists():
-            raise FileNotFoundError(
-                f"Importance file not found: {imp_path}\n"
-                f"Run with --mode importance first, or use --skip_fila."
+        if importances is None:
+            raise ValueError(
+                "FILA init requested but no importances provided. "
+                "Pass an importances dict or use --skip_fila."
             )
-        apply_fila_init(updated_model, str(imp_path), args)
+        apply_fila_init(updated_model, importances, args)
 
     updated_model = updated_model.train()
 
@@ -397,7 +435,9 @@ if __name__ == "__main__":
         args.lora_target_modules = cli_args.lora_target_modules
     args.skip_fila = cli_args.skip_fila
     args.importance_batches = cli_args.importance_batches
-    apply_benchmark_config(args, cli_args.benchmark, cli_args.tofu_split, cli_args.muse_corpus, cli_args.blur_task)
+    args.importance_batch_size = cli_args.importance_batch_size
+    args.load_in_4bit = cli_args.load_in_4bit
+    apply_benchmark_config(args, cli_args.benchmark, cli_args.tofu_split, cli_args.muse_corpus)
 
     SEED = args.seed
     torch.cuda.manual_seed(SEED)
@@ -406,38 +446,48 @@ if __name__ == "__main__":
     np.random.seed(SEED)
 
     if cli_args.mode == "importance":
-        # --- Phase 1: Compute Fisher importances ---
-        save_dir = SCRIPT_DIR / "importances"
-        save_path = save_dir / f"{args.model_name}_{args.bench_label}.pt"
+        # Fisher importances are now computed on-the-fly during unlearn mode
+        # to avoid the storage cost of saving them. This mode is kept as a
+        # no-op so existing wrapper scripts that call --mode importance first
+        # still work.
+        print("Note: --mode importance is a no-op; Fisher importances are now "
+              "computed in-memory during --mode unlearn (no save).")
+        import sys; sys.exit(0)
 
+    elif cli_args.mode == "unlearn":
+        # --- FILA init (in-memory Fisher) + IHL training ---
+        fila_tag = "fila" if not args.skip_fila else "nofila"
+        save_path = SCRIPT_DIR / f"checkpoints/loku/{args.bench_label}/{fila_tag}-{args.model_name}"
         if save_path.exists():
-            print(f"Fisher importances already exist at {save_path}; loading instead of recomputing.")
-        else:
-            model, tokenizer = load_model(args.model_path)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+            print(f"Unlearned model already saved at {save_path}; skipping.")
+            import sys
+            sys.exit(0)
 
-            forget_data_list, retain_data_list = get_data(
+        updated_model, tokenizer = load_model(args.model_path, load_in_4bit=args.load_in_4bit)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Compute Fisher importances in-memory (before LoRA is applied).
+        importances = None
+        if not args.skip_fila:
+            imp_forget_data, imp_retain_data = get_data(
                 forget_corpora=args.forget_corpora,
                 retain_corpora=args.retain_corpora,
-                batch_size=args.batch_size,
+                batch_size=args.importance_batch_size,
                 tokenizer=tokenizer,
                 chunk_sizes=args.max_lengths,
             )
-
             importances = compute_fisher_importances(
-                model, tokenizer, forget_data_list, retain_data_list, args,
+                updated_model, tokenizer, imp_forget_data, imp_retain_data, args,
             )
+            del imp_forget_data, imp_retain_data
+            clear_cuda_cache()
 
-            save_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(importances, save_path)
-            print(f"Saved Fisher importances to {save_path}")
-
-    elif cli_args.mode == "unlearn":
-        # --- Phase 2+3: FILA init + IHL training ---
-        updated_model, tokenizer = load_model(args.model_path)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            if importances is None:
+                print("No float-dtype target weights available for Fisher "
+                      "importance (base model is fully quantized). "
+                      "Falling back to standard LoRA zero-init (skip_fila).")
+                args.skip_fila = True
 
         forget_data_list, retain_data_list = get_data(
             forget_corpora=args.forget_corpora,
@@ -453,6 +503,7 @@ if __name__ == "__main__":
             forget_data_list=forget_data_list,
             retain_data_list=retain_data_list,
             args=args,
+            importances=importances,
         )
 
     clear_cuda_cache()

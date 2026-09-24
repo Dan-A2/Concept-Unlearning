@@ -1,6 +1,9 @@
 # Large dataset folders
 data/bio-forget-corpus/
 data/cyber-forget-corpus/
+data/inject-A/
+data/inject-F/
+OUT/
 
 # Slurm job files
 *.slurm

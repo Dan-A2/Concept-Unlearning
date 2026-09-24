@@ -50,11 +50,10 @@ class Args:
     finetune_lr = 1e-4
     finetune_steps = 300
 
-    layer_ids = [5, 6, 7]
-    lora_r = 32
-    lora_alpha = 64
+    lora_r = 16
+    lora_alpha = 32
     lora_dropout = 0.05
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     # Phase 2: P-tuning unlearning
     alpha = [1.0, 1.0]          # retain CE loss weight per topic
@@ -97,6 +96,7 @@ def parse_args():
                         help="Retain KL loss weight.")
     parser.add_argument("--lr", type=float, default=Args.lr,
                         help="Learning rate for Phase 2 prompt encoder parameters.")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit NF4 (QLoRA) for memory-constrained models such as Qwen3-32B.")
     add_benchmark_args(parser)
     return parser.parse_args()
 
@@ -118,10 +118,10 @@ def _run_finetune(model, tokenizer, forget_data_list, retain_data_list, args):
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=args.lora_target_modules,
-        layers_to_transform=args.layer_ids,
     )
     model = get_peft_model(model, lora_config)
     model.enable_input_require_grads()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.print_trainable_parameters()
     model.train()
 
@@ -309,8 +309,13 @@ if __name__ == "__main__":
     args.lr = cli_args.lr
     if cli_args.lora_target_modules is not None:
         args.lora_target_modules = cli_args.lora_target_modules
-    apply_benchmark_config(args, cli_args.benchmark, cli_args.tofu_split,
-                           cli_args.muse_corpus, cli_args.blur_task)
+    args.load_in_4bit = cli_args.load_in_4bit
+    apply_benchmark_config(args, cli_args.benchmark, cli_args.tofu_split, cli_args.muse_corpus)
+
+    save_path = SCRIPT_DIR / f"checkpoints/spul/{args.bench_label}/{args.model_name}"
+    if save_path.exists():
+        print(f"Unlearned model already saved at {save_path}; skipping.")
+        import sys; sys.exit(0)
 
     SEED = args.seed
     torch.cuda.manual_seed(SEED)
@@ -319,7 +324,7 @@ if __name__ == "__main__":
     np.random.seed(SEED)
 
     # Load model once
-    model, tokenizer = load_model(args.model_path)
+    model, tokenizer = load_model(args.model_path, load_in_4bit=args.load_in_4bit)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

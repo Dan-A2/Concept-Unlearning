@@ -9,7 +9,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-from baselines.utils import get_random_vector, get_params, forward_with_cache, load_model, get_data as _get_data_base, clear_cuda_cache, save_topic_loss_plot
+from baselines.utils import get_random_vector, forward_with_cache, load_model, get_data as _get_data_base, clear_cuda_cache, save_topic_loss_plot
 from baselines.benchmarks import add_benchmark_args, apply_benchmark_config
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -33,15 +33,13 @@ class Args:
     max_num_batches = 500
 
     layer_id = 7
-    layer_ids = [5, 6, 7]
-    param_ids = [6]
 
     # PEFT (LoRA) config
     use_peft = True
-    lora_r = 32
-    lora_alpha = 64
+    lora_r = 16
+    lora_alpha = 32
     lora_dropout = 0.05
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     seed = 42
 
@@ -74,11 +72,11 @@ def _apply_lora_if_enabled(updated_model, args):
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=args.lora_target_modules,
-        layers_to_transform=args.layer_ids,
     )
 
     updated_model = get_peft_model(updated_model, lora_config)
     updated_model.enable_input_require_grads()
+    updated_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     updated_model.print_trainable_parameters()
     return updated_model
 
@@ -89,6 +87,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default=Args.model_path, help="HuggingFace model ID or local path.")
     parser.add_argument("--model_name", type=str, default=None, help="Short name used for checkpoint dirs. Defaults to the last path segment of --model_path.")
     parser.add_argument("--lora_target_modules", type=str, nargs="+", default=None, help="LoRA target module names (e.g. q_proj v_proj). Defaults to class default.")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Load base model in 4-bit NF4 (QLoRA) for memory-constrained models such as Qwen3-32B.")
     add_benchmark_args(parser)
     return parser.parse_args()
 
@@ -139,10 +138,7 @@ def run_rsv(
     updated_model = _apply_lora_if_enabled(updated_model, args)
     updated_model = updated_model.train()
 
-    if args.use_peft:
-        params = [p for p in updated_model.parameters() if p.requires_grad]
-    else:
-        params = get_params(updated_model, args.layer_ids, args.param_ids)
+    params = [p for p in updated_model.parameters() if p.requires_grad]
 
     if len(params) == 0:
         raise ValueError("No trainable parameters found. Check PEFT config or selected params.")
@@ -261,15 +257,16 @@ if __name__ == "__main__":
     args.model_name = cli_args.model_name if cli_args.model_name is not None else cli_args.model_path.split("/")[-1]
     if cli_args.lora_target_modules is not None:
         args.lora_target_modules = cli_args.lora_target_modules
-    apply_benchmark_config(args, cli_args.benchmark, cli_args.tofu_split, cli_args.muse_corpus, cli_args.blur_task)
+    args.load_in_4bit = cli_args.load_in_4bit
+    apply_benchmark_config(args, cli_args.benchmark, cli_args.tofu_split, cli_args.muse_corpus)
     SEED = args.seed
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     
-    frozen_model, tokenizer = load_model(args.model_path)
-    updated_model, _ = load_model(args.model_path)
+    frozen_model, tokenizer = load_model(args.model_path, load_in_4bit=args.load_in_4bit)
+    updated_model, _ = load_model(args.model_path, load_in_4bit=args.load_in_4bit)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     

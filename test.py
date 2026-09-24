@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import time
+import zipfile
 import torch
 from datasets import load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -139,8 +140,7 @@ def load_tofu_texts(split_name: str) -> List[str]:
 def get_benchmark_corpora(
     benchmark: str,
     tofu_split: Optional[str] = None,
-    muse_corpus: Optional[str] = None,
-    blur_task: Optional[str] = None,
+    muse_corpus: Optional[str] = None
 ) -> Tuple[Dict[str, List[str]], List[str], List[str]]:
     """Return (corpora_dict, forget_names, retain_names) for a given benchmark."""
     if benchmark == "wmdp":
@@ -180,17 +180,6 @@ def get_benchmark_corpora(
         forget_names = [f"{muse_corpus}-forget"]
         retain_names = [f"{muse_corpus}-retain1", f"{muse_corpus}-retain2", "wikitext"]
 
-    elif benchmark == "blur":
-        if blur_task not in ("rwku", "whp"):
-            raise ValueError(f"--blur-task must be 'rwku' or 'whp', got {blur_task}")
-        corpora = {
-            f"{blur_task}-forget": load_hf_texts("forgelab/BLUR", f"{blur_task}_forget", "train"),
-            f"{blur_task}-retain": load_hf_texts("forgelab/BLUR", f"{blur_task}_retain", "train"),
-            "wikitext":            load_hf_texts("wikitext", "wikitext-2-raw-v1", "train"),
-        }
-        forget_names = [f"{blur_task}-forget"]
-        retain_names = [f"{blur_task}-retain", "wikitext"]
-
     else:
         raise ValueError(f"Unknown benchmark: {benchmark}")
 
@@ -203,6 +192,78 @@ def get_benchmark_corpora(
 
 def _get_input_device(model) -> torch.device:
     return next(model.parameters()).device
+
+
+def _is_quantized_checkpoint(model_path) -> bool:
+    """True if the checkpoint at `model_path` was saved with a bnb quant config
+    (e.g. the muse-books Qwen3-32B QLoRA finetune)."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+        return getattr(cfg, "quantization_config", None) is not None
+    except Exception:
+        return False
+
+
+def _bf16_balanced_device_map(model_path, torch_dtype):
+    """Plan a device_map that balances the *bf16* model across the GPUs.
+
+    A 4-bit checkpoint loaded with device_map='auto' is planned for its ~18GB
+    4-bit footprint (packed onto GPU0 first). Dequantizing then inflates every
+    layer ~3.5x to bf16 *in place*, so the bf16 weights pile up lopsided and
+    OOM. Planning the split from an empty bf16 skeleton (exactly what
+    device_map='auto' does for a bf16 load -- the balanced layout WMDP used)
+    and loading the 4-bit weights onto it keeps the post-dequant model balanced,
+    leaving each GPU the head-room the CoFi/CHess grad-streaming hooks rely on.
+    """
+    from transformers import AutoConfig
+    from accelerate import init_empty_weights, infer_auto_device_map
+    from accelerate.utils import get_balanced_memory
+
+    cfg = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+    # Rebuild the config WITHOUT the quantization_config key entirely; setting
+    # it to None leaves an attribute that the quantizer path calls .to_dict() on.
+    cfg_dict = cfg.to_dict()
+    cfg_dict.pop("quantization_config", None)
+    clean_cfg = type(cfg).from_dict(cfg_dict)
+    with init_empty_weights():
+        skel = AutoModelForCausalLM.from_config(clean_cfg, trust_remote_code=True)
+    no_split = getattr(skel, "_no_split_modules", None)
+    max_mem = get_balanced_memory(skel, dtype=torch_dtype,
+                                  no_split_module_classes=no_split)
+    dmap = infer_auto_device_map(skel, max_memory=max_mem, dtype=torch_dtype,
+                                 no_split_module_classes=no_split)
+    del skel
+    return dmap
+
+
+def _load_maybe_quantized(model_path, torch_dtype, device_map):
+    """Load a checkpoint, dequantizing bnb-4bit ones to bf16 on a balanced map.
+
+    Non-quantized checkpoints load exactly as before. Quantized ones (only the
+    muse-books Qwen finetune) are loaded onto a bf16-balanced device_map and
+    dequantized -- so CoFi's `requires_grad_` works and the layout matches WMDP.
+    """
+    if not _is_quantized_checkpoint(model_path):
+        return AutoModelForCausalLM.from_pretrained(
+            str(model_path), dtype=torch_dtype, trust_remote_code=True,
+            device_map=device_map,
+        )
+    try:
+        dmap = _bf16_balanced_device_map(model_path, torch_dtype)
+    except Exception as e:
+        print(f"  [{_ts()}] [warn] bf16-balanced device_map failed ({e}); "
+              f"falling back to device_map={device_map!r}")
+        dmap = device_map
+    print(f"  [{_ts()}] Quantized (4-bit) checkpoint -- loading on a "
+          f"bf16-balanced device_map, then dequantizing for CoFi/CHess ...")
+    # Pass dtype=torch_dtype so model.dtype is bf16: dequantize() targets
+    # model.dtype (transformers integrations/bitsandbytes.dequantize_and_replace),
+    # and the fp32 default would need ~128GB (32B x 4B) and OOM. bf16 -> ~64GB.
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_path), dtype=torch_dtype, trust_remote_code=True, device_map=dmap,
+    )
+    return model.dequantize()
 
 
 def load_model_and_tokenizer(
@@ -223,10 +284,10 @@ def load_model_and_tokenizer(
             cfg = json.load(f)
         base_model_name = cfg.get("base_model_name_or_path", "HuggingFaceH4/zephyr-7b-beta")
         print(f"  [{_ts()}] Adapter detected — loading base model {base_model_name} ...")
-        base = AutoModelForCausalLM.from_pretrained(
-            base_model_name, dtype=torch_dtype, trust_remote_code=True,
-            device_map=device_map,
-        )
+        # 4-bit base (e.g. muse-books Qwen finetune) is dequantized to bf16 on a
+        # balanced device_map so the merged LoRA has float weights CoFi can
+        # differentiate, without OOMing on an unbalanced dequant.
+        base = _load_maybe_quantized(base_model_name, torch_dtype, device_map)
         model = PeftModel.from_pretrained(base, model_path)
         peft_type = cfg.get("peft_type", "LORA").upper()
         MERGEABLE = {"LORA", "LOHA", "LOKR", "ADALORA", "IA3", "VERA", "BONE"}
@@ -243,10 +304,7 @@ def load_model_and_tokenizer(
                 model = _StripVtWrapper(model, num_vt)
     else:
         print(f"  [{_ts()}] Loading model weights ...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=torch_dtype, trust_remote_code=True,
-            device_map=device_map,
-        )
+        model = _load_maybe_quantized(model_path, torch_dtype, device_map)
 
     print(f"  [{_ts()}] Model loaded. {_mem_report()}")
     return model, tokenizer
@@ -354,8 +412,14 @@ def _autocast_dtype() -> torch.dtype:
 
 def compute_cofi(model, tokenizer, texts, max_length, batch_size, target_params):
     model.eval()
-    for _, param in target_params:
-        param.requires_grad_(True)
+    # Freeze every non-target param so backward only allocates .grad for the
+    # weights we actually care about. HF models load with requires_grad=True
+    # everywhere, which on large models wastes GPU memory on grad buffers for
+    # embedding / lm_head / layer norms.
+    target_ids = {id(p) for _, p in target_params}
+    original_rg = [(p, p.requires_grad) for p in model.parameters()]
+    for p in model.parameters():
+        p.requires_grad_(id(p) in target_ids)
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
@@ -369,52 +433,70 @@ def compute_cofi(model, tokenizer, texts, max_length, batch_size, target_params)
 
     scale_c = 1e6
     lambda_val = 1e-5
+    sqrt_scale_c = math.sqrt(scale_c)
+
+    # Stream each grad to CPU and clear it the instant autograd finishes
+    # accumulating it. Without this, every target param's .grad buffer is
+    # live on its GPU simultaneously during backward — on a 32B model that
+    # roughly doubles the per-GPU memory footprint and pushes A100-40GB
+    # over the wall. With this, peak GPU grad memory is ~one layer's worth.
+    def _make_cofi_hook(name):
+        target = accum[name]
+        def _hook(p):
+            if p.grad is None:
+                return
+            g = p.grad.detach().float()
+            g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
+            g.div_(sqrt_scale_c)
+            target.add_(g.pow_(2).cpu())
+            p.grad = None
+        return _hook
+
+    handles = [p.register_post_accumulate_grad_hook(_make_cofi_hook(name))
+               for name, p in target_params]
 
     total_batches = (len(texts) + batch_size - 1) // batch_size
 
-    for batch_idx, i in enumerate(range(0, len(texts), batch_size)):
-        enc = tokenizer(
-            texts[i:i + batch_size], return_tensors="pt",
-            padding=True, truncation=True, max_length=max_length
-        )
-
-        input_ids = enc["input_ids"].to(input_device)
-        attention_mask = enc["attention_mask"].to(input_device)
-        if input_ids.numel() == 0:
-            continue
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        model.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
-            shift_labels = shift_labels.masked_fill(shift_labels >= shift_logits.size(-1), -100)
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
+    try:
+        for batch_idx, i in enumerate(range(0, len(texts), batch_size)):
+            enc = tokenizer(
+                texts[i:i + batch_size], return_tensors="pt",
+                padding=True, truncation=True, max_length=max_length
             )
-        loss.backward()
 
-        for name, param in target_params:
-            if param.grad is not None:
-                g = param.grad.detach().float()
-                g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
-                g.div_(math.sqrt(scale_c))
-                # Move to CPU before accumulating
-                accum[name] += g.pow_(2).cpu()
-                param.grad = None
-        n_steps += 1
+            input_ids = enc["input_ids"].to(input_device)
+            attention_mask = enc["attention_mask"].to(input_device)
+            if input_ids.numel() == 0:
+                continue
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
 
-        del input_ids, attention_mask, labels, enc, loss, logits, shift_logits, shift_labels
+            model.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+                shift_labels = shift_labels.masked_fill(shift_labels >= shift_logits.size(-1), -100)
+                loss = torch.nn.functional.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+            loss.backward()  # hooks fire here, streaming grads off-GPU
+            n_steps += 1
 
-        if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == total_batches:
-            print(f"      [{_ts()}] CoFi batch {batch_idx+1}/{total_batches}")
+            del input_ids, attention_mask, labels, enc, loss, logits, shift_logits, shift_labels
+
+            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == total_batches:
+                print(f"      [{_ts()}] CoFi batch {batch_idx+1}/{total_batches}")
+    finally:
+        for h in handles:
+            h.remove()
 
     model.zero_grad(set_to_none=True)
     model.gradient_checkpointing_disable()
+    for p, rg in original_rg:
+        p.requires_grad_(rg)
 
     if n_steps > 0:
         for name in accum:
@@ -446,8 +528,11 @@ def compute_chess(model, tokenizer, texts, max_length, batch_size, target_params
     avoiding the recompute pass during backward.
     """
     model.eval()
-    for _, param in target_params:
-        param.requires_grad_(True)
+    # Freeze every non-target param (see note in compute_cofi).
+    target_ids = {id(p) for _, p in target_params}
+    original_rg = [(p, p.requires_grad) for p in model.parameters()]
+    for p in model.parameters():
+        p.requires_grad_(id(p) in target_ids)
     if use_checkpointing:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -471,96 +556,122 @@ def compute_chess(model, tokenizer, texts, max_length, batch_size, target_params
     scale_c = 1e6
     lambda_val = 1e-5
 
+    # State shared between phase-aware hooks (see comment in compute_cofi for
+    # the rationale — streams grads off-GPU during backward to bound peak GPU
+    # memory at ~one layer's worth of grad buffers).
+    g_plus_cpu: Dict[str, torch.Tensor] = {}
+    z_dict_ref: Dict[str, torch.Tensor] = {}
+    phase = ["plus"]   # mutable: "plus" or "minus"
+
+    def _make_chess_hook(name):
+        target = accum[name]
+        def _hook(p):
+            if p.grad is None:
+                return
+            g = p.grad.detach().float().cpu()
+            p.grad = None
+            if phase[0] == "plus":
+                g_plus_cpu[name] = g
+            else:
+                gp = g_plus_cpu.pop(name, None)
+                if gp is None:
+                    return
+                z = z_dict_ref[name].float()
+                hvp = gp.sub_(g).div_(2 * eps).mul_(z)
+                hvp.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+                hvp.div_(scale_c)
+                target.add_(hvp)
+        return _hook
+
+    handles = [p.register_post_accumulate_grad_hook(_make_chess_hook(name))
+               for name, p in target_params]
+
     total_batches = (len(texts) + batch_size - 1) // batch_size
 
-    for batch_idx, i in enumerate(range(0, len(texts), batch_size)):
-        enc = tokenizer(
-            texts[i:i + batch_size], return_tensors="pt",
-            padding=True, truncation=True, max_length=max_length
-        )
-        input_ids = enc["input_ids"].to(input_device)
-        attention_mask = enc["attention_mask"].to(input_device)
-        if input_ids.numel() == 0:
-            continue
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
+    try:
+        for batch_idx, i in enumerate(range(0, len(texts), batch_size)):
+            enc = tokenizer(
+                texts[i:i + batch_size], return_tensors="pt",
+                padding=True, truncation=True, max_length=max_length
+            )
+            input_ids = enc["input_ids"].to(input_device)
+            attention_mask = enc["attention_mask"].to(input_device)
+            if input_ids.numel() == 0:
+                continue
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
 
-        for h_idx in range(n_hutchinson):
-            # Generate z_dict on CPU to avoid holding large Rademacher vectors on GPU.
-            # Perturbations are applied one parameter at a time via a temporary .to(device) call.
-            if base_seed is not None:
-                gen = torch.Generator(device="cpu").manual_seed(
-                    _chess_probe_seed(base_seed, corpus_name, batch_idx, h_idx)
-                )
-                z_dict = {
-                    name: (torch.randint(0, 2, p.shape, generator=gen) * 2 - 1).to(p.dtype)
-                    for name, p in target_params
-                }
-            else:
-                z_dict = {
-                    name: (torch.randint(0, 2, p.shape, dtype=p.dtype) * 2 - 1)
-                    for name, p in target_params
-                }
+            for h_idx in range(n_hutchinson):
+                # Build the Rademacher probe (CPU, in param dtype).
+                if base_seed is not None:
+                    gen = torch.Generator(device="cpu").manual_seed(
+                        _chess_probe_seed(base_seed, corpus_name, batch_idx, h_idx)
+                    )
+                    z_dict_local = {
+                        name: (torch.randint(0, 2, p.shape, generator=gen) * 2 - 1).to(p.dtype)
+                        for name, p in target_params
+                    }
+                else:
+                    z_dict_local = {
+                        name: (torch.randint(0, 2, p.shape, dtype=p.dtype) * 2 - 1)
+                        for name, p in target_params
+                    }
+                z_dict_ref.clear()
+                z_dict_ref.update(z_dict_local)
 
-            for name, p in target_params:
-                p.data.add_(z_dict[name].to(p.device), alpha=eps)
+                for name, p in target_params:
+                    p.data.add_(z_dict_local[name].to(p.device), alpha=eps)
 
-            model.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
-                shift_labels = shift_labels.masked_fill(shift_labels >= shift_logits.size(-1), -100)
-                loss_plus = torch.nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100
-                )
-            loss_plus.backward()
+                # --- plus pass ---
+                phase[0] = "plus"
+                g_plus_cpu.clear()
+                model.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    shift_logits = outputs.logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+                    shift_labels = shift_labels.masked_fill(shift_labels >= shift_logits.size(-1), -100)
+                    loss_plus = torch.nn.functional.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100
+                    )
+                loss_plus.backward()   # hooks populate g_plus_cpu
 
-            # Move g_plus to CPU immediately to free GPU memory before the second backward.
-            g_plus = {}
-            for name, p in target_params:
-                if p.grad is not None:
-                    g_plus[name] = p.grad.detach().float().cpu()
-                    p.grad = None
+                for name, p in target_params:
+                    p.data.sub_(z_dict_local[name].to(p.device), alpha=2*eps)
 
-            for name, p in target_params:
-                p.data.sub_(z_dict[name].to(p.device), alpha=2*eps)
+                # --- minus pass ---
+                phase[0] = "minus"
+                model.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    shift_logits = outputs.logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+                    shift_labels = shift_labels.masked_fill(shift_labels >= shift_logits.size(-1), -100)
+                    loss_minus = torch.nn.functional.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100
+                    )
+                loss_minus.backward()   # hooks compute HVP and add to accum
 
-            model.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
-                shift_labels = shift_labels.masked_fill(shift_labels >= shift_logits.size(-1), -100)
-                loss_minus = torch.nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100
-                )
-            loss_minus.backward()
+                # Restore params and drop the probe.
+                for name, p in target_params:
+                    p.data.add_(z_dict_local[name].to(p.device), alpha=eps)
+                z_dict_ref.clear()
+                del z_dict_local, loss_plus, loss_minus, outputs, shift_logits, shift_labels
 
-            # HVP computation done on CPU since g_plus, z_dict, and accum are all on CPU.
-            for name, p in target_params:
-                if p.grad is not None and name in g_plus:
-                    hvp = g_plus.pop(name)  # float32 CPU tensor
-                    hvp.sub_(p.grad.float().cpu()).div_(2 * eps)
-                    hvp.mul_(z_dict[name].float())
-                    hvp.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
-                    hvp.div_(scale_c)
-                    accum[name].add_(hvp)
+            n_steps += 1
+            del input_ids, attention_mask, labels, enc
 
-                p.data.add_(z_dict[name].to(p.device), alpha=eps)
-                p.grad = None
-
-            del loss_plus, loss_minus, g_plus, outputs, shift_logits, shift_labels, z_dict
-
-        n_steps += 1
-        del input_ids, attention_mask, labels, enc
-
-        if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == total_batches:
-            print(f"      [{_ts()}] CHess batch {batch_idx+1}/{total_batches}")
+            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == total_batches:
+                print(f"      [{_ts()}] CHess batch {batch_idx+1}/{total_batches}")
+    finally:
+        for h in handles:
+            h.remove()
 
     model.zero_grad(set_to_none=True)
     if use_checkpointing:
         model.gradient_checkpointing_disable()
+    for p, rg in original_rg:
+        p.requires_grad_(rg)
 
     if n_steps > 0:
         for name in accum:
@@ -597,8 +708,9 @@ def frob_norm_drop(d_orig, d_unlearned):
     return sum_sq ** 0.5 / (n_params ** 0.5)
 
 
-def _cache_path(label: str, corpus: str, metric: str, ext: str = ".pt") -> Path:
-    """Return a nested cache path: CACHE_DIR/method/benchmark/model/corpus__metric.ext
+def _cache_path(label: str, corpus: str, metric: str, subset_id: Optional[int] = None,
+                ext: str = ".pt") -> Path:
+    """Return a nested cache path: CACHE_DIR/method/benchmark/model/corpus__metric[__subN].ext
 
     Mirrors the checkpoints directory structure (method/benchmark/model).
     _BENCHMARK must be set (by main()) before calling this function.
@@ -616,26 +728,141 @@ def _cache_path(label: str, corpus: str, metric: str, ext: str = ".pt") -> Path:
         model_dir = label
 
     safe_model = re.sub(r"[^a-zA-Z0-9_\-]", "_", model_dir)
-    suffix = f"_seed{_CHESS_SEED}" if (metric == "chess" and _CHESS_SEED is not None) else ""
-    return CACHE_DIR / method_dir / _BENCHMARK / safe_model / f"{corpus}__{metric}{suffix}{ext}"
+    sub_suffix = f"__sub{subset_id}" if subset_id is not None else ""
+    seed_suffix = f"_seed{_CHESS_SEED}" if (metric == "chess" and _CHESS_SEED is not None) else ""
+    return (CACHE_DIR / method_dir / _BENCHMARK / safe_model /
+            f"{corpus}__{metric}{sub_suffix}{seed_suffix}{ext}")
 
 
-def _json_cache_path(label: str, corpus: str, metric: str) -> Path:
-    return _cache_path(label, corpus, metric, ext=".json")
+def _json_cache_path(label: str, corpus: str, metric: str, subset_id: Optional[int] = None) -> Path:
+    return _cache_path(label, corpus, metric, subset_id=subset_id, ext=".json")
 
 
-def _pt_cache_path(label: str, corpus: str, metric: str) -> Path:
-    return _cache_path(label, corpus, metric, ext=".pt")
+def _pt_cache_path(label: str, corpus: str, metric: str, subset_id: Optional[int] = None) -> Path:
+    return _cache_path(label, corpus, metric, subset_id=subset_id, ext=".pt")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic subset sampling for confidence intervals
+# ---------------------------------------------------------------------------
+
+def _subset_index_path(corpus_name: str, subset_id: int) -> Path:
+    return CACHE_DIR / "_subsets" / _BENCHMARK / f"{corpus_name}__sub{subset_id}.json"
+
+
+def _subset_indices(corpus_name: str, n_total: int, subset_id: int, n_samples: int) -> List[int]:
+    """Return the index list for (corpus, subset_id).
+
+    The saved JSON is the source of truth: if it exists, indices are loaded
+    from there and returned verbatim (n_samples is ignored on hit). On first
+    call, indices are generated from a deterministic seed
+    md5(f"{corpus}|sub{subset_id}")[:8] and written to disk for all future
+    callers (other models, other methods, re-runs after wall-time hits).
+    """
+    path = _subset_index_path(corpus_name, subset_id)
+    if path.exists():
+        with open(path) as f:
+            data = json.load(f)
+        idx = data["indices"]
+        out_of_range = [i for i in idx if i >= n_total]
+        if out_of_range:
+            raise RuntimeError(
+                f"Saved subset {path} has {len(out_of_range)} index/indices "
+                f">= current corpus size {n_total} (e.g. {out_of_range[:3]}). "
+                "The corpus has changed since this subset was recorded. "
+                "Delete the file to regenerate, but note that any cached "
+                "metrics under this (corpus, subset_id) will then refer to "
+                "different documents and should also be removed."
+            )
+        return idx
+
+    seed = int(hashlib.md5(f"{corpus_name}|sub{subset_id}".encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    if n_total <= n_samples:
+        idx = list(range(n_total))
+    else:
+        idx = sorted(rng.sample(range(n_total), n_samples))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"corpus": corpus_name, "subset_id": subset_id,
+                   "n_total": n_total, "n_samples": len(idx), "indices": idx}, f)
+    return idx
+
+
+def _subset_texts(texts: List[str], corpus_name: str, subset_id: int,
+                  n_samples: int) -> List[str]:
+    idx = _subset_indices(corpus_name, len(texts), subset_id, n_samples)
+    return [texts[i] for i in idx]
+
+
+def _chess_subsample(texts: List[str], corpus_name: str, subset_id: int,
+                     n_chess: int) -> List[str]:
+    """Take a deterministic random subset of `n_chess` docs from `texts`.
+
+    Used to make CHess cheaper on large models without touching the on-disk
+    subset record (CoFi/PPL still see the full subset). The selection is
+    seeded from (corpus, subset_id) so base and unlearned models pick the
+    *same* docs and their CHess Frobenius drop remains comparable. Indices
+    are not persisted — this is a runtime-only convenience.
+    """
+    if n_chess >= len(texts):
+        return texts
+    seed = int(hashlib.md5(f"{corpus_name}|sub{subset_id}|chess".encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    return [texts[i] for i in sorted(rng.sample(range(len(texts)), n_chess))]
 
 
 def _save_pt(d: dict, path: Path):
-    """Save a tensor dict as half-precision .pt (used for base model only)."""
+    """Save a tensor dict as half-precision .pt (used for base model only).
+
+    Convert each tensor in place so we don't briefly hold both the fp32 and
+    fp16 versions of the whole dict in memory at once. On Qwen3-32B that
+    doubling crashed cgroup-limited jobs even at --mem=400G.
+
+    Written atomically (temp file + rename) so an interrupted or disk-full
+    write never leaves a truncated .pt behind that later crashes torch.load.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({k: v.half() for k, v in d.items()}, path)
+    for k in list(d.keys()):
+        d[k] = d[k].half()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(d, tmp)
+        os.replace(tmp, path)          # atomic on the same filesystem
+    finally:
+        if tmp.exists():
+            tmp.unlink()               # clean up a failed partial write
+
+
+def _pt_valid(path: Path) -> bool:
+    """Cheap integrity check for a torch .pt (zip) file.
+
+    torch's .pt is a zip whose central directory is written last, so a
+    truncated/failed write fails to open as a zip. Reading the central
+    directory is O(1)-ish (seeks to the end), far cheaper than loading the
+    62 GB of tensors. Returns False for missing, non-zip, or truncated files.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        # Opening the zip parses the end-of-central-directory record (written
+        # last by torch.save); a truncated file raises here. namelist() is a
+        # cheap central-directory read — we do NOT testzip() (that would CRC
+        # the full 62 GB).
+        with zipfile.ZipFile(path) as zf:
+            return len(zf.namelist()) > 0
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def _load_pt(path: Path) -> dict:
     """Load a tensor dict from .pt, converting back to float32."""
+    if not _pt_valid(path):
+        raise OSError(
+            f"Corrupt/truncated cache file: {path}. Delete it (or rerun the "
+            f"base eval) to regenerate."
+        )
     return {k: v.float() for k, v in
             torch.load(path, map_location="cpu", weights_only=True).items()}
 
@@ -652,36 +879,38 @@ def _load_json(path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Output Logger
-# ---------------------------------------------------------------------------
-class OutputLogger:
-    def __init__(self, filepath: Path):
-        self.terminal = sys.stdout
-        self.log = open(filepath, "w", encoding="utf-8")
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.flush()  # auto-flush after every write
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+class _QuietArgParser(argparse.ArgumentParser):
+    """Argparse subclass that omits the multi-line usage dump on errors."""
+    def error(self, message):
+        self.exit(2, f"test.py: error: {message}\n")
+
+
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = _QuietArgParser()
     p.add_argument("--base-model", default="HuggingFaceH4/zephyr-7b-beta")
     p.add_argument("--checkpoints-dir", default=str(PROJECT_ROOT / "checkpoints"))
     p.add_argument("--checkpoint", nargs=2, metavar=("PATH", "LABEL"), action="append", default=[])
     p.add_argument("--auto-discover", action="store_true")
-    p.add_argument("--orig-max-samples", type=int, default=200)
+    p.add_argument("--orig-max-samples", type=int, default=200,
+                   help="(Legacy alias; see --n-samples-per-subset.) Samples per subset.")
     p.add_argument("--unlearned-max-samples", type=int, default=200,
-                   help="Number of samples for CoFi/CHess on unlearned models (default: 200).")
+                   help="(Legacy alias; see --n-samples-per-subset.) Samples per subset.")
+    p.add_argument("--subset-ids", type=int, nargs="+", default=[0, 1, 2],
+                   help="Subset IDs to evaluate. Each ID picks a deterministic, "
+                        "model-independent sample of size --n-samples-per-subset from "
+                        "each corpus, so confidence intervals can be derived across "
+                        "subsets. Default: 0 1 2.")
+    p.add_argument("--n-samples-per-subset", type=int, default=200,
+                   help="Number of documents sampled per subset (default: 200).")
+    p.add_argument("--base-only", action="store_true",
+                   help="Compute base-model metrics for all subsets and exit. "
+                        "Unlearned --checkpoint args are ignored.")
+    p.add_argument("--require-base-cache", action="store_true",
+                   help="Refuse to (re)compute base metrics; require .pt cache to exist. "
+                        "Use this on the per-checkpoint slurms once base eval has run.")
     p.add_argument("--batch-size", type=int, default=4,
                    help="Batch size for CoFi/CHess gradient computation.")
     p.add_argument("--batch-size-grad", type=int, default=4)
@@ -719,9 +948,13 @@ def parse_args():
                         "uses small batches; turn it back on if you OOM.")
     p.add_argument("--target-modules", nargs="+", default=DEFAULT_TARGET_MODULES)
     p.add_argument("--skip-chess", action="store_true")
+    p.add_argument("--skip-cofi", action="store_true",
+                   help="Skip CoFi computation. Useful on large models where the "
+                        "fp32 CoFi accumulator (~param-count bytes × 4) exceeds "
+                        "available CPU RAM.")
     p.add_argument("--skip-perplexity", action="store_true")
     p.add_argument("--benchmark", type=str, default="wmdp",
-                   choices=["wmdp", "tofu", "muse", "blur"],
+                   choices=["wmdp", "tofu", "muse"],
                    help="Evaluation benchmark (default: wmdp).")
     p.add_argument("--tofu-split", type=str, default=None,
                    choices=["forget01", "forget05", "forget10"],
@@ -729,9 +962,6 @@ def parse_args():
     p.add_argument("--muse-corpus", type=str, default=None,
                    choices=["news", "books"],
                    help="MUSE corpus (required when --benchmark muse).")
-    p.add_argument("--blur-task", type=str, default=None,
-                   choices=["rwku", "whp"],
-                   help="BLUR task (required when --benchmark blur).")
     p.add_argument("--model-filter", type=str, default=None,
                    help="Only discover checkpoints whose name contains this string.")
     return p.parse_args()
@@ -781,14 +1011,6 @@ def main():
     if len(method_str) > 50:
         method_str = "multiple_methods"
 
-    # 3. Create the nested directory structure
-    # log_filename = f"{method_str}.txt"
-    # log_dir = PROJECT_ROOT / "test" / model_name
-    # log_dir.mkdir(parents=True, exist_ok=True)
-
-    # 4. Initialize the logger
-    # sys.stdout = OutputLogger(log_dir / log_filename)
-
     torch_dtype = (
         torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         else torch.float16 if torch.cuda.is_available()
@@ -799,8 +1021,7 @@ def main():
     bench_label_map = {
         "wmdp": "wmdp",
         "tofu": f"tofu-{args.tofu_split}" if args.tofu_split else None,
-        "muse": f"muse-{args.muse_corpus}" if args.muse_corpus else None,
-        "blur": f"blur-{args.blur_task}" if args.blur_task else None,
+        "muse": f"muse-{args.muse_corpus}" if args.muse_corpus else None
     }
     bench_label = bench_label_map.get(args.benchmark)
 
@@ -830,15 +1051,23 @@ def main():
 
     print(f"[{_ts()}] Loading datasets (benchmark={args.benchmark})...")
     corpora, forget_names, retain_names = get_benchmark_corpora(
-        args.benchmark, args.tofu_split, args.muse_corpus, args.blur_task
+        args.benchmark, args.tofu_split, args.muse_corpus
     )
 
-    for name in list(corpora.keys()):
-        if len(corpora[name]) > args.orig_max_samples:
-            corpora[name] = random.sample(corpora[name], args.orig_max_samples)
-
+    # Subsampling is now done per (corpus, subset_id) — see _subset_texts.
+    # The full corpora are kept in memory so subsets can be drawn deterministically.
+    n_per_sub = args.n_samples_per_subset
+    subset_ids = list(args.subset_ids)
     for name, texts in corpora.items():
-        print(f"  {name:15s}: {len(texts):6d} samples")
+        print(f"  {name:15s}: {len(texts):6d} docs total  "
+              f"→ {min(len(texts), n_per_sub)} per subset × {len(subset_ids)} subsets")
+
+    # Materialise the subset index lists upfront so they exist before any
+    # eval step needs them; from here on _subset_indices() will always read
+    # from JSON rather than re-deriving from the seed.
+    for name, texts in corpora.items():
+        for sid in subset_ids:
+            _subset_indices(name, len(texts), sid, n_per_sub)
 
     print(f"[{_ts()}] Datasets loaded. {_mem_report()}")
 
@@ -851,45 +1080,36 @@ def main():
     print(f"[{_ts()}] ORIGINAL MODEL")
     print("=" * 70)
 
-    # Base tensor dicts (.pt) are saved to disk so we never have to
-    # recompute them.  Only the base model uses .pt files; unlearned
-    # models only store scalar JSON results.
-    missing_cofi_pt = [
-        c for c in all_corpora_names
-        if not _pt_cache_path(base_label, c, "cofi").exists()
-    ]
-    missing_chess_pt = (
-        [] if args.skip_chess else
-        [c for c in all_corpora_names
-         if not _pt_cache_path(base_label, c, "chess").exists()]
-    )
-    missing_cofi_json = [
-        c for c in all_corpora_names
-        if not _json_cache_path(base_label, c, "cofi").exists()
-    ]
-    missing_chess_json = (
-        [] if args.skip_chess else
-        [c for c in all_corpora_names
-         if not _json_cache_path(base_label, c, "chess").exists()]
-    )
-    missing_ppl = (
-        [] if args.skip_perplexity else
-        [c for c in all_corpora_names
-         if not _json_cache_path(base_label, c, "ppl").exists()]
-    )
+    # Per-subset cache misses. Base needs .pt for CoFi/CHess and JSON for PPL,
+    # one per (corpus, subset_id). A truncated/corrupt .pt counts as missing so
+    # it gets recomputed rather than crashing a later drop computation.
+    missing_cofi_pt = ([] if args.skip_cofi else
+                       [(c, sid) for c in all_corpora_names for sid in subset_ids
+                        if not _pt_valid(_pt_cache_path(base_label, c, "cofi", sid))])
+    missing_chess_pt = ([] if args.skip_chess else
+                        [(c, sid) for c in all_corpora_names for sid in subset_ids
+                         if not _pt_valid(_pt_cache_path(base_label, c, "chess", sid))])
+    missing_ppl = ([] if args.skip_perplexity else
+                   [(c, sid) for c in all_corpora_names for sid in subset_ids
+                    if not _json_cache_path(base_label, c, "ppl", sid).exists()])
 
     need_model = bool(missing_cofi_pt or missing_chess_pt or missing_ppl)
 
-    n = len(all_corpora_names)
-    print(f"[{_ts()}] Base cache status:")
-    print(f"    CoFi .pt : {n - len(missing_cofi_pt)}/{n} cached"
-          + (f"  (missing: {missing_cofi_pt})" if missing_cofi_pt else ""))
+    n_pairs = len(all_corpora_names) * len(subset_ids)
+    print(f"[{_ts()}] Base cache status ({n_pairs} corpus×subset pairs):")
+    if not args.skip_cofi:
+        print(f"    CoFi .pt : {n_pairs - len(missing_cofi_pt)}/{n_pairs} cached")
     if not args.skip_chess:
-        print(f"    CHess.pt : {n - len(missing_chess_pt)}/{n} cached"
-              + (f"  (missing: {missing_chess_pt})" if missing_chess_pt else ""))
+        print(f"    CHess.pt : {n_pairs - len(missing_chess_pt)}/{n_pairs} cached")
     if not args.skip_perplexity:
-        print(f"    PPL      : {n - len(missing_ppl)}/{n} cached"
-              + (f"  (missing: {missing_ppl})" if missing_ppl else ""))
+        print(f"    PPL      : {n_pairs - len(missing_ppl)}/{n_pairs} cached")
+
+    if need_model and args.require_base_cache:
+        raise SystemExit(
+            f"--require-base-cache is set but {len(missing_cofi_pt)} CoFi / "
+            f"{len(missing_chess_pt)} CHess / {len(missing_ppl)} PPL base entries "
+            f"are missing. Run the base-eval slurm first."
+        )
 
     if not need_model:
         print(f"[{_ts()}] All base metrics cached — not loading base model.")
@@ -903,84 +1123,83 @@ def main():
         input_device = _get_input_device(model)
 
         if missing_ppl:
-            print(f"\n  [{_ts()}] Perplexity (concatenated sliding-window):")
-            for corpus_name, texts in corpora.items():
-                ppl_json = _json_cache_path(base_label, corpus_name, "ppl")
-                if ppl_json.exists():
-                    cached = _load_json(ppl_json)
-                    print(f"    {corpus_name:15s}: PPL = {cached['ppl']:.4f}  [cached]")
-                    continue
-                print(f"    [{_ts()}] Starting PPL for '{corpus_name}' ...")
+            print(f"\n  [{_ts()}] Perplexity (per subset, full subset):")
+            for corpus_name, sid in missing_ppl:
+                ppl_json = _json_cache_path(base_label, corpus_name, "ppl", sid)
+                ppl_texts = _subset_texts(corpora[corpus_name], corpus_name, sid, n_per_sub)
+                print(f"    [{_ts()}] PPL '{corpus_name}' sub{sid} ({len(ppl_texts)} docs) ...")
                 ppl, n_toks, n_docs = compute_perplexity(
-                    model, tokenizer, texts[:100],
-                    max_length=args.ppl_max_length,
-                    stride=args.ppl_stride,
-                    device=input_device,
-                    max_tokens=args.ppl_max_tokens,
+                    model, tokenizer, ppl_texts,
+                    max_length=args.ppl_max_length, stride=args.ppl_stride,
+                    device=input_device, max_tokens=args.ppl_max_tokens,
                 )
-                _save_json({"ppl": ppl, "n_tokens": n_toks, "n_docs": n_docs}, ppl_json)
-                print(f"    {corpus_name:15s}: PPL = {ppl:.4f}  ({n_toks:,} tokens, {n_docs} docs)")
+                _save_json({"ppl": ppl, "n_tokens": n_toks, "n_docs": n_docs,
+                            "subset_id": sid}, ppl_json)
+                print(f"    {corpus_name:15s} sub{sid}: PPL = {ppl:.4f}  ({n_toks:,} tokens)")
             _flush_memory()
 
         if missing_cofi_pt:
             print(f"\n  [{_ts()}] Computing CoFi for base model "
-                  f"({len(missing_cofi_pt)} corpora):")
-            for corpus_name in missing_cofi_pt:
-                texts = corpora[corpus_name]
-                grad_texts = _chunk_long_texts(texts, tokenizer, args.max_length)[:args.orig_max_samples]
-                print(f"    [{_ts()}] CoFi on '{corpus_name}' ({len(grad_texts)} samples) ...")
+                  f"({len(missing_cofi_pt)} corpus×subset pairs):")
+            for corpus_name, sid in missing_cofi_pt:
+                sub_texts = _subset_texts(corpora[corpus_name], corpus_name, sid, n_per_sub)
+                grad_texts = _chunk_long_texts(sub_texts, tokenizer, args.max_length)[:n_per_sub]
+                print(f"    [{_ts()}] CoFi '{corpus_name}' sub{sid} ({len(grad_texts)}) ...")
                 result = compute_cofi(
                     model, tokenizer, grad_texts,
-                    args.max_length, args.batch_size_grad, target_params
+                    args.max_length, args.batch_size_grad, target_params,
                 )
-                _save_pt(result, _pt_cache_path(base_label, corpus_name, "cofi"))
+                # Frobenius norm first (on fp32 tensors), then save — _save_pt
+                # converts to fp16 in place to keep CPU memory low on large
+                # models, so the fp32 reading must happen beforehand.
                 norm_val = frob_norm(result)
-                _save_json({"frob_norm": norm_val}, _json_cache_path(base_label, corpus_name, "cofi"))
+                _save_json({"frob_norm": norm_val, "subset_id": sid},
+                           _json_cache_path(base_label, corpus_name, "cofi", sid))
+                _save_pt(result, _pt_cache_path(base_label, corpus_name, "cofi", sid))
                 del result
                 _flush_memory()
-                print(f"    {corpus_name:15s}: ||F||_F = {norm_val:.6f}  {_mem_report()}")
+                print(f"    {corpus_name:15s} sub{sid}: ||F||_F = {norm_val:.6f}  {_mem_report()}")
 
         if missing_chess_pt:
             print(f"\n  [{_ts()}] Computing CHess for base model "
-                  f"({len(missing_chess_pt)} corpora):")
-            for corpus_name in missing_chess_pt:
-                texts = corpora[corpus_name]
-                grad_texts = _chunk_long_texts(texts, tokenizer, chess_max_length)[:args.orig_max_samples]
-                print(f"    [{_ts()}] CHess on '{corpus_name}' ({len(grad_texts)} samples) ...")
+                  f"({len(missing_chess_pt)} corpus×subset pairs):")
+            for corpus_name, sid in missing_chess_pt:
+                sub_texts = _subset_texts(corpora[corpus_name], corpus_name, sid, n_per_sub)
+                sub_texts = _chess_subsample(sub_texts, corpus_name, sid, chess_max_samples)
+                grad_texts = _chunk_long_texts(sub_texts, tokenizer, chess_max_length)[:chess_max_samples]
+                print(f"    [{_ts()}] CHess '{corpus_name}' sub{sid} ({len(grad_texts)}) ...")
                 result = compute_chess(
                     model, tokenizer, grad_texts,
                     chess_max_length, chess_batch_size, target_params, args.n_hutchinson,
                     use_checkpointing=chess_use_checkpointing,
-                    base_seed=args.chess_seed, corpus_name=corpus_name,
+                    base_seed=args.chess_seed,
+                    corpus_name=f"{corpus_name}__sub{sid}",
                 )
-                _save_pt(result, _pt_cache_path(base_label, corpus_name, "chess"))
+                # Frobenius norm first (fp32) — _save_pt mutates to fp16.
                 norm_val = frob_norm(result)
-                _save_json({"frob_norm": norm_val}, _json_cache_path(base_label, corpus_name, "chess"))
+                _save_json({"frob_norm": norm_val, "subset_id": sid},
+                           _json_cache_path(base_label, corpus_name, "chess", sid))
+                _save_pt(result, _pt_cache_path(base_label, corpus_name, "chess", sid))
                 del result
                 _flush_memory()
-                print(f"    {corpus_name:15s}: ||H||_F = {norm_val:.6f}  {_mem_report()}")
-
-        # Also write any missing base frob_norm JSONs from existing .pt files
-        for corpus_name in (set(missing_cofi_json) - set(missing_cofi_pt)):
-            d = _load_pt(_pt_cache_path(base_label, corpus_name, "cofi"))
-            _save_json({"frob_norm": frob_norm(d)}, _json_cache_path(base_label, corpus_name, "cofi"))
-            del d
-        for corpus_name in (set(missing_chess_json) - set(missing_chess_pt)):
-            d = _load_pt(_pt_cache_path(base_label, corpus_name, "chess"))
-            _save_json({"frob_norm": frob_norm(d)}, _json_cache_path(base_label, corpus_name, "chess"))
-            del d
+                print(f"    {corpus_name:15s} sub{sid}: ||H||_F = {norm_val:.6f}  {_mem_report()}")
 
         print(f"\n  [{_ts()}] Unloading base model ...")
         del model, tokenizer, target_params
         _flush_memory()
         print(f"  [{_ts()}] Base model unloaded. {_mem_report()}")
 
+    if args.base_only:
+        print(f"\n[{_ts()}] --base-only: skipping unlearned evaluation.")
+        return
+
     # ====================================================================
     # STEP 2 — Each unlearned model
     # ====================================================================
-    ppl_table:  Dict[str, Dict[str, float]] = {}
-    cofi_drops: Dict[str, Dict[str, float]] = {}
-    chess_drops: Dict[str, Dict[str, float]] = {}
+    # Per-subset measurements: {label: {corpus: {subset_id: value}}}
+    ppl_per_sub:   Dict[str, Dict[str, Dict[int, float]]] = {}
+    cofi_per_sub:  Dict[str, Dict[str, Dict[int, float]]] = {}
+    chess_per_sub: Dict[str, Dict[str, Dict[int, float]]] = {}
 
     total_models = len(unlearned)
     for model_idx, (label, model_path) in enumerate(unlearned, 1):
@@ -989,32 +1208,25 @@ def main():
         print(f"Path: {model_path}")
         print("=" * 70)
 
-        unl_missing_cofi = [
-            c for c in all_corpora_names
-            if not _json_cache_path(label, c, "cofi").exists()
-        ]
-        unl_missing_chess = (
-            [] if args.skip_chess else
-            [c for c in all_corpora_names
-             if not _json_cache_path(label, c, "chess").exists()]
-        )
-        unl_missing_ppl = (
-            [] if args.skip_perplexity else
-            [c for c in all_corpora_names
-             if not _json_cache_path(label, c, "ppl").exists()]
-        )
+        unl_missing_cofi = ([] if args.skip_cofi else
+                            [(c, sid) for c in all_corpora_names for sid in subset_ids
+                             if not _json_cache_path(label, c, "cofi", sid).exists()])
+        unl_missing_chess = ([] if args.skip_chess else
+                             [(c, sid) for c in all_corpora_names for sid in subset_ids
+                              if not _json_cache_path(label, c, "chess", sid).exists()])
+        unl_missing_ppl = ([] if args.skip_perplexity else
+                           [(c, sid) for c in all_corpora_names for sid in subset_ids
+                            if not _json_cache_path(label, c, "ppl", sid).exists()])
         all_cached = not (unl_missing_cofi or unl_missing_chess or unl_missing_ppl)
 
-        n_tot = len(all_corpora_names)
-        print(f"  [{_ts()}] Cache status:")
-        print(f"    CoFi  : {n_tot - len(unl_missing_cofi)}/{n_tot} cached"
-              + (f"  (missing: {unl_missing_cofi})" if unl_missing_cofi else ""))
+        n_tot = len(all_corpora_names) * len(subset_ids)
+        print(f"  [{_ts()}] Cache status ({n_tot} corpus×subset pairs):")
+        if not args.skip_cofi:
+            print(f"    CoFi  : {n_tot - len(unl_missing_cofi)}/{n_tot} cached")
         if not args.skip_chess:
-            print(f"    CHess : {n_tot - len(unl_missing_chess)}/{n_tot} cached"
-                  + (f"  (missing: {unl_missing_chess})" if unl_missing_chess else ""))
+            print(f"    CHess : {n_tot - len(unl_missing_chess)}/{n_tot} cached")
         if not args.skip_perplexity:
-            print(f"    PPL   : {n_tot - len(unl_missing_ppl)}/{n_tot} cached"
-                  + (f"  (missing: {unl_missing_ppl})" if unl_missing_ppl else ""))
+            print(f"    PPL   : {n_tot - len(unl_missing_ppl)}/{n_tot} cached")
 
         need_model = not all_cached
 
@@ -1028,86 +1240,94 @@ def main():
         else:
             print(f"  [{_ts()}] All metrics cached — skipping model load.")
 
-        # --- Perplexity (cached as JSON) ---
+        ppl_per_sub.setdefault(label, {c: {} for c in all_corpora_names})
+        cofi_per_sub.setdefault(label, {c: {} for c in all_corpora_names})
+        chess_per_sub.setdefault(label, {c: {} for c in all_corpora_names})
+
+        # --- Perplexity (per subset) ---
         if not args.skip_perplexity:
-            ppl_table[label] = {}
-            if unl_missing_ppl:
-                input_device = _get_input_device(model)
-                print(f"\n  [{_ts()}] Perplexity (concatenated sliding-window):")
-                for corpus_name, texts in corpora.items():
-                    ppl_json = _json_cache_path(label, corpus_name, "ppl")
+            input_device = _get_input_device(model) if model is not None else None
+            for corpus_name in all_corpora_names:
+                for sid in subset_ids:
+                    ppl_json = _json_cache_path(label, corpus_name, "ppl", sid)
                     if ppl_json.exists():
-                        cached = _load_json(ppl_json)
-                        ppl_table[label][corpus_name] = cached["ppl"]
-                        print(f"    {corpus_name:15s}: PPL = {cached['ppl']:.4f}  [cached]")
+                        ppl_per_sub[label][corpus_name][sid] = _load_json(ppl_json)["ppl"]
                         continue
-                    print(f"    [{_ts()}] Starting PPL for '{corpus_name}' ...")
+                    ppl_texts = _subset_texts(corpora[corpus_name], corpus_name, sid, n_per_sub)
+                    print(f"    [{_ts()}] PPL '{corpus_name}' sub{sid} ({len(ppl_texts)} docs) ...")
                     ppl, n_toks, n_docs = compute_perplexity(
-                        model, tokenizer, texts[:100],
-                        max_length=args.ppl_max_length,
-                        stride=args.ppl_stride,
-                        device=input_device,
-                        max_tokens=args.ppl_max_tokens,
+                        model, tokenizer, ppl_texts,
+                        max_length=args.ppl_max_length, stride=args.ppl_stride,
+                        device=input_device, max_tokens=args.ppl_max_tokens,
                     )
-                    _save_json({"ppl": ppl, "n_tokens": n_toks, "n_docs": n_docs}, ppl_json)
-                    ppl_table[label][corpus_name] = ppl
-                    print(f"    {corpus_name:15s}: PPL = {ppl:.4f}  ({n_toks:,} tokens, {n_docs} docs)")
-                _flush_memory()
-            else:
-                print(f"\n  [{_ts()}] Perplexity: all cached.")
-                for corpus_name in all_corpora_names:
-                    cached = _load_json(_json_cache_path(label, corpus_name, "ppl"))
-                    ppl_table[label][corpus_name] = cached["ppl"]
+                    _save_json({"ppl": ppl, "n_tokens": n_toks, "n_docs": n_docs,
+                                "subset_id": sid}, ppl_json)
+                    ppl_per_sub[label][corpus_name][sid] = ppl
+                    print(f"    {corpus_name:15s} sub{sid}: PPL = {ppl:.4f}")
+            _flush_memory()
 
-        # --- CoFi norm drops (load base .pt on demand, save scalar JSON) ---
-        cofi_drops[label] = {}
-        print(f"\n  [{_ts()}] CoFi norm drops (vs. base):")
-        for corpus_name, texts in corpora.items():
-            cofi_json = _json_cache_path(label, corpus_name, "cofi")
-
-            if cofi_json.exists():
-                drop = _load_json(cofi_json)["norm_drop"]
-                print(f"    {corpus_name:15s}: [cached]  ||Δ F||_F = {drop:.6f}")
-            else:
-                grad_texts = _chunk_long_texts(texts, tokenizer, args.max_length)[:args.unlearned_max_samples]
-                print(f"    [{_ts()}] CoFi on '{corpus_name}' ({len(grad_texts)} samples) ...")
-                result = compute_cofi(
-                    model, tokenizer, grad_texts,
-                    args.max_length, args.batch_size_grad, target_params
-                )
-                base_dict = _load_pt(_pt_cache_path(base_label, corpus_name, "cofi"))
-                drop = frob_norm_drop(base_dict, result)
-                del base_dict, result
-                _flush_memory()
-                _save_json({"norm_drop": drop}, cofi_json)
-                print(f"    {corpus_name:15s}: ||Δ F||_F = {drop:.6f}")
-            cofi_drops[label][corpus_name] = drop
+        # --- CoFi norm drops (per subset, vs. base[subset]) ---
+        if not args.skip_cofi:
+            print(f"\n  [{_ts()}] CoFi norm drops (vs. base, per subset):")
+            for corpus_name in all_corpora_names:
+                for sid in subset_ids:
+                    cofi_json = _json_cache_path(label, corpus_name, "cofi", sid)
+                    if cofi_json.exists():
+                        drop = _load_json(cofi_json)["norm_drop"]
+                        print(f"    {corpus_name:15s} sub{sid}: [cached]  ||Δ F||_F = {drop:.6f}")
+                    else:
+                        sub_texts = _subset_texts(corpora[corpus_name], corpus_name, sid, n_per_sub)
+                        grad_texts = _chunk_long_texts(sub_texts, tokenizer, args.max_length)[:n_per_sub]
+                        print(f"    [{_ts()}] CoFi '{corpus_name}' sub{sid} ({len(grad_texts)}) ...")
+                        result = compute_cofi(
+                            model, tokenizer, grad_texts,
+                            args.max_length, args.batch_size_grad, target_params,
+                        )
+                        base_pt = _pt_cache_path(base_label, corpus_name, "cofi", sid)
+                        if not base_pt.exists():
+                            raise FileNotFoundError(
+                                f"Base CoFi cache missing: {base_pt}. Run base eval first."
+                            )
+                        base_dict = _load_pt(base_pt)
+                        drop = frob_norm_drop(base_dict, result)
+                        del base_dict, result
+                        _flush_memory()
+                        _save_json({"norm_drop": drop, "subset_id": sid}, cofi_json)
+                        print(f"    {corpus_name:15s} sub{sid}: ||Δ F||_F = {drop:.6f}")
+                    cofi_per_sub[label][corpus_name][sid] = drop
 
         if not args.skip_chess:
-            chess_drops[label] = {}
-            print(f"\n  [{_ts()}] CHess norm drops (vs. base):")
-            for corpus_name, texts in corpora.items():
-                chess_json = _json_cache_path(label, corpus_name, "chess")
-
-                if chess_json.exists():
-                    drop = _load_json(chess_json)["norm_drop"]
-                    print(f"    {corpus_name:15s}: [cached]  ||Δ H||_F = {drop:.6f}")
-                else:
-                    grad_texts = _chunk_long_texts(texts, tokenizer, chess_max_length)[:args.unlearned_max_samples]
-                    print(f"    [{_ts()}] CHess on '{corpus_name}' ({len(grad_texts)} samples) ...")
-                    result = compute_chess(
-                        model, tokenizer, grad_texts,
-                        chess_max_length, chess_batch_size, target_params, args.n_hutchinson,
-                        use_checkpointing=chess_use_checkpointing,
-                        base_seed=args.chess_seed, corpus_name=corpus_name,
-                    )
-                    base_dict = _load_pt(_pt_cache_path(base_label, corpus_name, "chess"))
-                    drop = frob_norm_drop(base_dict, result)
-                    del base_dict, result
-                    _flush_memory()
-                    _save_json({"norm_drop": drop}, chess_json)
-                    print(f"    {corpus_name:15s}: ||Δ H||_F = {drop:.6f}")
-                chess_drops[label][corpus_name] = drop
+            print(f"\n  [{_ts()}] CHess norm drops (vs. base, per subset):")
+            for corpus_name in all_corpora_names:
+                for sid in subset_ids:
+                    chess_json = _json_cache_path(label, corpus_name, "chess", sid)
+                    if chess_json.exists():
+                        drop = _load_json(chess_json)["norm_drop"]
+                        print(f"    {corpus_name:15s} sub{sid}: [cached]  ||Δ H||_F = {drop:.6f}")
+                    else:
+                        sub_texts = _subset_texts(corpora[corpus_name], corpus_name, sid, n_per_sub)
+                        sub_texts = _chess_subsample(sub_texts, corpus_name, sid, chess_max_samples)
+                        grad_texts = _chunk_long_texts(sub_texts, tokenizer, chess_max_length)[:chess_max_samples]
+                        print(f"    [{_ts()}] CHess '{corpus_name}' sub{sid} ({len(grad_texts)}) ...")
+                        result = compute_chess(
+                            model, tokenizer, grad_texts,
+                            chess_max_length, chess_batch_size, target_params, args.n_hutchinson,
+                            use_checkpointing=chess_use_checkpointing,
+                            base_seed=args.chess_seed,
+                            corpus_name=f"{corpus_name}__sub{sid}",
+                        )
+                        base_pt = _pt_cache_path(base_label, corpus_name, "chess", sid)
+                        if not base_pt.exists():
+                            raise FileNotFoundError(
+                                f"Base CHess cache missing: {base_pt}. Run base eval first."
+                            )
+                        base_dict = _load_pt(base_pt)
+                        drop = frob_norm_drop(base_dict, result)
+                        del base_dict, result
+                        _flush_memory()
+                        _save_json({"norm_drop": drop, "subset_id": sid}, chess_json)
+                        print(f"    {corpus_name:15s} sub{sid}: ||Δ H||_F = {drop:.6f}")
+                    chess_per_sub[label][corpus_name][sid] = drop
 
         if model is not None:
             print(f"  [{_ts()}] Unloading model '{label}' ...")
@@ -1116,7 +1336,7 @@ def main():
             print(f"  [{_ts()}] Model unloaded. {_mem_report()}")
 
     # ====================================================================
-    # STEP 3 — Summary tables
+    # STEP 3 — Summary tables (mean ± std across subsets, with 95% CI half-width)
     # ====================================================================
     if not unlearned:
         return
@@ -1124,38 +1344,54 @@ def main():
     col_w = max(len(lbl) for lbl, _ in unlearned)
     all_corpora = forget_names + retain_names
 
-    def print_table(drops, title):
+    def _agg(values):
+        """Return (mean, std, ci95_half) where ci95_half is the t-distribution
+        half-width for a 95% CI (or nan if <2 samples)."""
+        vals = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        if not vals:
+            return float("nan"), float("nan"), float("nan")
+        mean = sum(vals) / len(vals)
+        if len(vals) < 2:
+            return mean, 0.0, float("nan")
+        var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+        std = math.sqrt(var)
+        # t-critical for 95% with df=n-1. Tabulated for n=2..5.
+        t_crit = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776}.get(len(vals) - 1, 1.96)
+        ci_half = t_crit * std / math.sqrt(len(vals))
+        return mean, std, ci_half
+
+    def print_table(per_sub, title, fmt="{:.6f}"):
         print("\n" + "=" * 70)
         print(title)
-        print("(↑ forget = better unlearning   ↓ retain = less collateral damage)")
+        if "Drop" in title:
+            print("(↑ forget = better unlearning   ↓ retain = less collateral damage)")
+        print(f"Subsets: {subset_ids}   format: mean ± 95% CI (std)")
         print("=" * 70)
-        header = f"{'Model':{col_w}s} | " + " | ".join(f"{c:>15s}" for c in all_corpora)
+        cell_w = 26  # room for "mean ± ci (std=...)" style
+        header = f"{'Model':{col_w}s} | " + " | ".join(f"{c:>{cell_w}s}" for c in all_corpora)
         print(header)
         print("-" * len(header))
         for label, _ in unlearned:
-            if label not in drops:
+            if label not in per_sub:
                 continue
-            row = f"{label:{col_w}s} | "
-            row += " | ".join(f"{drops[label].get(c, float('nan')):>15.6f}" for c in all_corpora)
-            print(row)
+            cells = []
+            for c in all_corpora:
+                vals = list(per_sub[label].get(c, {}).values())
+                mean, std, ci = _agg(vals)
+                if math.isnan(mean):
+                    cells.append("nan".rjust(cell_w))
+                elif math.isnan(ci):
+                    cells.append(fmt.format(mean).rjust(cell_w))
+                else:
+                    cells.append(f"{fmt.format(mean)} ± {fmt.format(ci)} (σ={fmt.format(std)})".rjust(cell_w))
+            print(f"{label:{col_w}s} | " + " | ".join(cells))
 
-    print_table(cofi_drops,  "Normalized CoFi Frobenius Norm Drops  (1/√N)||F^o − F^u||_F")
+    if not args.skip_cofi:
+        print_table(cofi_per_sub,  "Normalized CoFi Frobenius Norm Drops  (1/√N)||F^o − F^u||_F")
     if not args.skip_chess:
-        print_table(chess_drops, "Normalized CHess Frobenius Norm Drops  (1/√N)||H^o − H^u||_F")
-
-    if not args.skip_perplexity and ppl_table:
-        print("\n" + "=" * 70)
-        print("Perplexity  (concatenated sliding-window)")
-        print("=" * 70)
-        header = f"{'Model':{col_w}s} | " + " | ".join(f"{c:>15s}" for c in all_corpora)
-        print(header)
-        print("-" * len(header))
-        for label, _ in unlearned:
-            if label not in ppl_table:
-                continue
-            row = f"{label:{col_w}s} | "
-            row += " | ".join(f"{ppl_table[label].get(c, float('nan')):>15.4f}" for c in all_corpora)
-            print(row)
+        print_table(chess_per_sub, "Normalized CHess Frobenius Norm Drops  (1/√N)||H^o − H^u||_F")
+    if not args.skip_perplexity:
+        print_table(ppl_per_sub, "Perplexity  (concatenated sliding-window)", fmt="{:.4f}")
 
     print(f"\n[{_ts()}] All done.")
 
