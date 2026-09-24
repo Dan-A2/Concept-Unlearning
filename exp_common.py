@@ -1,4 +1,4 @@
-"""Shared helpers for the reviewer-rebuttal experiments (E0-E3 + injection).
+"""Shared helpers for the reviewer-rebuttal experiments (E0-E3).
 
 Everything reuses test.py's CoFi/CHess/frob machinery UNCHANGED so the numbers
 are identical to production. The only new concept is the relative shift from

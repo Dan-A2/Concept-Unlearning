@@ -11,7 +11,6 @@
 | **WMDP** | Weapons of Mass Destruction Proxy — bio & cyber MCQ accuracy (+ MMLU utility control) |
 | **TOFU** | Fictional-persona unlearning (`forget01`, `forget05`, `forget10` splits) |
 | **MUSE** | Memorization unlearning on `books` and `news` corpora |
-| **inject** | Synthetic known-fact injection setting with an exact removal oracle (see [Validity experiments](#validity-experiments)) |
 
 ## Unlearning Methods
 
@@ -76,11 +75,10 @@ Concept-Unlearning/
 ├── cofi_relative_report.py # Re-report the ablation as Relative Drop (%)
 ├── e2_correlations.py      # Structural vs behavioural correlations (CPU only)
 ├── e3_adjacency.py         # Adjacency diagnostic (Fisher overlap + embeddings)
-├── known_fact_injection.py # Synthetic injection setting with an exact oracle
 └── exp_common.py           # Shared helpers for the validity experiments
 ```
 
-> **Not tracked in this repo:** `checkpoints/`, `Results/`, `OUT/`, `importances/`, `cofi_cache/`, `data/bio-forget-corpus/`, `data/cyber-forget-corpus/`, `data/inject-A/`, `data/inject-F/`, and all `*.slurm` job scripts — generated at runtime, machine-specific, or too large for version control.
+> **Not tracked in this repo:** `checkpoints/`, `Results/`, `OUT/`, `importances/`, `cofi_cache/`, `data/bio-forget-corpus/`, `data/cyber-forget-corpus/`, and all `*.slurm` job scripts — generated at runtime, machine-specific, or too large for version control.
 
 ---
 
@@ -337,15 +335,13 @@ Output goes to `Results/chess_ablation/`.
 |--------|----------|
 | `e2_correlations.py` | Do the structural metrics track the behavioural ones? Spearman correlations with BCa bootstrap CIs between CoFi shift, behavioural drop, adjacency gap and relearn recovery. CPU only. |
 | `e3_adjacency.py` | Is a candidate adjacent-retain set valid? Fisher top-*k* overlap (per model) and sentence-embedding similarity (per benchmark). |
-| `known_fact_injection.py` | Does TRIAGE call an *exact* removal localized? Builds a synthetic setting with two disjoint fact sets, injects both via separate LoRA adapters, and compares against an oracle that has one adapter removed by construction. |
 
 ```bash
 python e2_correlations.py
 python e3_adjacency.py --benchmarks wmdp muse-books
-python known_fact_injection.py --model Llama-3.1-8B --stages 1 2 3 4
 ```
 
-`e2_correlations.py` and `e3_adjacency.py` write to `Results/rebuttal/`; the injection experiment writes to `Results/rebuttal/injection/`. Shared machinery for all three lives in `exp_common.py`.
+`e2_correlations.py` and `e3_adjacency.py` write to `Results/rebuttal/`; Shared machinery for both lives in `exp_common.py`.
 
 ---
 
