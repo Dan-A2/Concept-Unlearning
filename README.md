@@ -349,26 +349,6 @@ python known_fact_injection.py --model Llama-3.1-8B --stages 1 2 3 4
 
 ---
 
-## Running on HPC (Slurm)
-
-Slurm job scripts are kept out of version control (`*.slurm` is git-ignored) because the `#SBATCH` headers are account- and partition-specific. The local set mirrors the stages above:
-
-| Stage | Slurm Script |
-|-------|--------------|
-| TOFU / MUSE fine-tuning | `tofu_finetune.slurm`, `muse_finetune.slurm` |
-| Unlearning sweeps | `unlearn1.slurm` … `unlearn4.slurm` |
-| Structural eval — base model | `test_base.slurm`, `test_base_qwen.slurm` |
-| Structural eval — checkpoints | `test1.slurm` … `test5.slurm` |
-| Behavioural eval | `behavioral_eval.slurm`, `base_eval.slurm`, `behavioral_adjacent.slurm` |
-| Relearning attack | `relearn_attack.slurm` |
-| Ablations | `chess_probe_ablation.slurm`, `cofi_relative_report.slurm` |
-| Validity experiments | `e2_correlations.slurm`, `e3_adjacency.slurm`, `known_fact_injection.slurm` |
-| Analysis / aggregation | `run_analysis.slurm`, `aggregate_results.slurm` |
-
-> GPU jobs request 2× A100 (80 GB) with up to 100 GB RAM. Aggregation, analysis and the CPU-only experiments run on CPU partitions.
-
----
-
 ## Models
 
 The framework is tested on:
