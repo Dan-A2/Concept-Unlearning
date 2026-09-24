@@ -94,7 +94,7 @@ pip install torch transformers peft datasets accelerate
 
 The evaluation stages additionally need `lm-eval` (WMDP / MMLU), `sentence-transformers` (adjacency diagnostic), and `pandas`, `seaborn`, `matplotlib`, `scipy` for the analysis scripts.
 
-> On Sulis HPC the required modules are pre-loaded by Slurm — see the [HPC section](#running-on-hpc-slurm) below.
+> On Sulis HPC the required modules are pre-loaded by Slurm.
 
 ### 2. Data
 
